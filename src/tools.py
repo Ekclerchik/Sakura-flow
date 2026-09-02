@@ -170,6 +170,34 @@ def _get_process_using_port(port):
         return None
 
 
+def stop_process_by_port(port):
+    """Kill the process(es) listening on a given port. Returns True on success."""
+    killed = []
+    try:
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr and conn.laddr.port == port and conn.status == 'LISTEN' and conn.pid:
+                try:
+                    proc = psutil.Process(conn.pid)
+                    if proc.name().lower() in ('winws.exe', 'sakuraflow.exe'):
+                        continue
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    killed.append(proc.name())
+                except psutil.NoSuchProcess:
+                    continue
+                except psutil.AccessDenied:
+                    subprocess.run(f'taskkill /F /PID {conn.pid}', shell=True, capture_output=True)
+                    killed.append(f"PID {conn.pid}")
+    except Exception as e:
+        logging.error(f"[MTPROTO] stop_process_by_port error: {e}")
+        return False
+    if killed:
+        logging.info(f"[MTPROTO] Stopped on port {port}: {', '.join(killed)}")
+        time.sleep(0.5)
+        return not _get_process_using_port(port)
+    return True
+
+
 def start_mtproto_proxy(port=1080, host='127.0.0.1', secret=None):
     global _proxies
     
@@ -407,8 +435,35 @@ def is_winws_running():
 
 
 def is_ipv6_disabled():
+    return not _is_ipv6_enabled_actual()
+
+
+def _is_ipv6_enabled_actual():
+    """Реальная проверка: IPv6 считается включенным, если есть хотя бы один
+    активный (connected/up) IPv6-интерфейс, кроме loopback."""
     try:
-        # Check DisabledComponents registry key
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv6', 'show', 'interfaces'],
+            capture_output=True, text=True, errors="replace", shell=True
+        )
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                if re.search(r'\b(connected|up)\b', line, re.IGNORECASE):
+                    parts = line.split()
+                    # пропускаем заголовки и итоги: реальная строка начинается с ID интерфейса
+                    if len(parts) >= 4 and parts[0].isdigit() and int(parts[0]) > 1:
+                        return True
+            # если строки не распарсились (русская локаль), падаем на реестр
+        return _ipv6_registry_enabled()
+    except Exception:
+        return _ipv6_registry_enabled()
+
+
+def _ipv6_registry_enabled():
+    """Проверка через реестр. DisabledComponents — битовая маска, а не флаг.
+    Полностью отключает IPv6 только значение 0xFF (или 0x11/0x21 в связке с
+    включенной политикой). Ненулевое значение само по себе НЕ означает отключение."""
+    try:
         result = subprocess.run([
             'reg', 'query',
             'HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters',
@@ -418,21 +473,13 @@ def is_ipv6_disabled():
             match = re.search(r'DisabledComponents\s+REG_DWORD\s+0x([0-9a-fA-F]+)', result.stdout)
             if match:
                 value = int(match.group(1), 16)
-                if value != 0:
-                    return True
-
-        # Also check via netsh — if no interfaces have IPv6 enabled, it's disabled
-        result = subprocess.run(
-            ['netsh', 'interface', 'ipv6', 'show', 'addresses'],
-            capture_output=True, text=True, errors="replace", shell=True
-        )
-        lines = [l for l in result.stdout.split('\n') if 'Address' in l and '::1' not in l]
-        if len(lines) == 0:
-            return True
-
-        return False
-    except:
-        return False
+                # 0xFF и 0x11/0x21 с политикой — фактическое отключение;
+                # остальные значения (например 0x20 = prefer IPv4) IPv6 НЕ отключают
+                if value == 0xFF:
+                    return False
+        return True
+    except Exception:
+        return True
 
 
 def disable_ipv6():

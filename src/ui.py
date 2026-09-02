@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QScrollArea)
 from PyQt5.QtGui import QDesktopServices, QIcon, QFont, QCursor
-from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG
+from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot
 
 try:
     myappid = 'ekcler.sakuraflow.v1.2'
@@ -20,10 +20,10 @@ except Exception:
 
 try:
     from .config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR
-    from . import service, autostart, state, tools
+    from . import service, autostart, state, tools, repair
 except ImportError:
     from src.config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR
-    from src import service, autostart, state, tools
+    from src import service, autostart, state, tools, repair
 
 
 class ListEditorWindow(QWidget):
@@ -113,21 +113,148 @@ class NetworkToolsWindow(QWidget):
         self.ipset_btn.setText(self._get_ipset_label())
         
         self.log_area.append("Ready!")
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_stats)
         self.timer.start(1000)
 
     def log_append(self, text, color=None):
-        """Thread-safe log append. color: 'green', 'red' or None."""
+        """Thread-safe log append. color: 'green', 'red' or None. Runs on the worker
+        (repair) thread; the actual GUI write is queued to this window's slots.
+        Во время ремонта каждая фаза дописывается в лог, а НИЖНЯЯ строка лога
+        используется спиннером как статус (переписывается in-place, как \r в консоли)."""
         if color:
             html = f'<span style="color: {color};">{text}</span>'
         else:
             html = text
-        QMetaObject.invokeMethod(self.log_area, "append", Qt.QueuedConnection, Q_ARG(str, html))
+        if getattr(self, "_spinner_on", False):
+            # новый этап: сначала «закрепляем» текущий статус-строку как обычную,
+            # затем таймер крутится поверх новой строки
+            self._spin_log = re.sub(r"<[^>]+>", "", html)
+            self._sp_commit_line(html)
+        else:
+            try:
+                QMetaObject.invokeMethod(self.log_area, "append",
+                                         Qt.QueuedConnection, Q_ARG(str, html))
+            except Exception as e:
+                logging.error(f"[spinner] append failed: {e}")
+
+    def _sp_commit_line(self, html):
+        """Записывает этап как отдельную строку НАД шарик-строкой (последней),
+        чтобы прогресс копился в логе, а шарик крутился на последней строке."""
+        try:
+            QMetaObject.invokeMethod(self, "_sp_insert_before_last",
+                                     Qt.QueuedConnection, Q_ARG(str, html))
+        except Exception as e:
+            logging.error(f"[spinner] commit failed: {e}")
+
+    @pyqtSlot(str)
+    def _sp_insert_before_last(self, html):
+        """GUI-слот: вставляет html строкой перед последней (шарик) строкой.
+        Fehl: простые строки (raw-вывод с \n и табами) вставляем insertText,
+        чтобы не давить переносы (insertHtml схлопывает \n и ломает табуляцию),
+        а цветные (<span ...>) — insertHtml, чтобы цвет не потерялся."""
+        try:
+            cur = self.log_area.textCursor()
+            doc = self.log_area.document()
+            last = doc.lastBlock()
+            cur.setPosition(last.position())
+            cur.beginEditBlock()
+            if "<sp" in html or "<b" in html or "<font" in html:
+                cur.insertHtml(html)
+            else:
+                cur.insertText(html)
+            cur.insertBlock()
+            cur.endEditBlock()
+            self._trim_log()
+            self._ensure_bottom()
+        except Exception as e:
+            logging.error(f"[spinner] insert before last: {e}")
+
+    def _ensure_bottom(self):
+        """Скроллит лог вниз только если юзер уже у низа — иначе не мешает
+        читать/крутить лог вручную во время ремонта."""
+        try:
+            sb = self.log_area.verticalScrollBar()
+            if sb.value() >= sb.maximum() - 6:
+                sb.setValue(sb.maximum())
+        except Exception:
+            pass
+
+    _MAX_LOG_BLOCKS = 4000
+
+    def _trim_log(self):
+        """Не даём логу-документу расти бесконечно: если строк (блоков) стало больше
+        лимита, удаляем верхнюю часть. Иначе QTextDocument копит все строки в памяти
+        и после многих запусков кнопки процесс «раздувается» (20 -> 36 МБ и выше)."""
+        doc = self.log_area.document()
+        try:
+            while doc.blockCount() > self._MAX_LOG_BLOCKS:
+                first = doc.begin()
+                cur = self.log_area.textCursor()
+                cur.setPosition(first.position())
+                cur.setPosition(first.next().position(), cur.KeepAnchor)
+                cur.removeSelectedText()
+        except Exception as e:
+            logging.error(f"[spinner] trim: {e}")
+
+    def start_spinner(self):
+        """Включает «крутящийся шарик» (⠋⠙⠹...) в последней строке лога. GUI-поток."""
+        self._spinner_on = True
+        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spin_i = 0
+        # берём текущую последнюю строку как старт-статус (обычно «Ready!»)
+        last = self.log_area.document().lastBlock().text()
+        self._spin_log = re.sub(r"<[^>]+>", "", last)
+        self.spin_timer = QTimer(self)
+        self.spin_timer.timeout.connect(self._spin_tick)
+        self.spin_timer.start(100)
+
+    def stop_spinner_final(self, text="Готово."):
+        """Отключает спиннер и оставляет итог в последней строке лога. GUI-поток."""
+        self._spinner_on = False
+        try:
+            self.spin_timer.stop()
+            self.spin_timer.deleteLater()
+        except Exception as e:
+            logging.error(f"[spinner] stop final: {e}")
+        self._sp_rewrite_last(text)
+
+    @pyqtSlot(object)
+    def _spinner_bridge(self, fn):
+        """Выполняет fn в GUI-потоке (вызывается через invokeMethod)."""
+        try:
+            fn()
+        except Exception as e:
+            logging.error(f"[spinner] bridge: {e}")
+
+    def _spin_tick(self):
+        if not getattr(self, "_spinner_on", False):
+            return
+        self._spin_i += 1
+        frame = self._spin_frames[self._spin_i % len(self._spin_frames)]
+        self._sp_rewrite_last(f"{frame} {self._spin_log}")
+
+    @pyqtSlot(str)
+    def _sp_rewrite_last(self, text):
+        """Переписывает последнюю строку QTextEdit (как \r в консоли). GUI-поток."""
+        try:
+            cur = self.log_area.textCursor()
+            doc = self.log_area.document()
+            block = doc.lastBlock()
+            b_from = block.position()
+            b_to = b_from + block.length() - 1
+            cur.setPosition(b_from)
+            cur.setPosition(b_to, cur.KeepAnchor)
+            cur.removeSelectedText()
+            cur.insertText(text)
+            self._trim_log()
+            self._ensure_bottom()
+        except Exception as e:
+            logging.error(f"[spinner] rewrite: {e}")
 
     def init_ui(self):
         self.setWindowTitle("Sakura Flow")
-        self.setFixedSize(450, 750)
+        self.setFixedSize(450, 800)
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setWindowFlags(Qt.Window)
         self.setStyleSheet("""
@@ -135,7 +262,7 @@ class NetworkToolsWindow(QWidget):
             QLineEdit { 
                 background-color: rgba(45, 35, 60, 0.6); 
                 border: 1px solid rgba(108, 92, 231, 0.3); 
-                padding: 5px; border-radius: 4px; color: #e8e8f0;
+                padding: 8px; border-radius: 4px; color: #e8e8f0;
             }
             QLineEdit:focus { border: 1px solid #ff7aa2; }
             QPushButton { 
@@ -157,14 +284,9 @@ class NetworkToolsWindow(QWidget):
             QScrollArea { background-color: #0b0a12; border: none; }
         """)
         
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { background-color: #0b0a12; border: none; }")
-        
-        scroll_content = QWidget()
         layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(5)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(3)
 
         layout.addWidget(QLabel("Blocklist Management:"))
         blocklist_row = QHBoxLayout()
@@ -173,6 +295,14 @@ class NetworkToolsWindow(QWidget):
         blocklist_row.addWidget(self.edit_list_btn)
         blocklist_row.addWidget(self.edit_ignore_btn)
         layout.addLayout(blocklist_row)
+
+        self.repair_btn = QPushButton("🔧 Fix && Troubleshoot")
+        self.repair_btn.setStyleSheet("""
+            QPushButton { background-color: rgba(108, 92, 231, 0.18); border: 1px solid rgba(108, 92, 231, 0.45); color: #b8b0e0; padding: 8px; border-radius: 4px; }
+            QPushButton:hover { background-color: rgba(108, 92, 231, 0.32); border: 1px solid #8b80ff; color: #ffffff; }
+            QPushButton:disabled { background-color: rgba(128, 128, 128, 0.15); border: 1px solid rgba(128,128,128,0.35); color: #777; }
+        """)
+        layout.addWidget(self.repair_btn)
 
         filter_row = QHBoxLayout()
         self.game_filter_btn = QPushButton(self._get_game_filter_label())
@@ -191,7 +321,7 @@ class NetworkToolsWindow(QWidget):
         filter_row.addWidget(self.ipset_btn)
         layout.addLayout(filter_row)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
         layout.addWidget(QLabel("Network Utilities:"))
         self.host_input = QLineEdit()
         self.host_input.setPlaceholderText("google.com")
@@ -209,7 +339,7 @@ class NetworkToolsWindow(QWidget):
         """)
         layout.addWidget(self.clear_discord_btn)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
         layout.addWidget(QLabel("MTPROTO PROXY:"))
         host_port_layout = QHBoxLayout()
         host_port_layout.addWidget(QLabel("Host:"))
@@ -237,12 +367,12 @@ class NetworkToolsWindow(QWidget):
 
         self.mtproto_toggle_btn = QPushButton("START")
         self.mtproto_toggle_btn.setStyleSheet("""
-            QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
+            QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 8px; border-radius: 4px; }
             QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
         """)
         layout.addWidget(self.mtproto_toggle_btn)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
         layout.addWidget(QLabel("DNS Optimizer & Tester:"))
         dns_input_layout = QHBoxLayout()
         self.dns_input = QLineEdit()
@@ -263,18 +393,18 @@ class NetworkToolsWindow(QWidget):
         self.apply_dns_btn.hide()
         layout.addWidget(self.apply_dns_btn)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
         layout.addWidget(QLabel("IPv6:"))
         if self._ipv6_on:
             self.ipv6_toggle_btn = QPushButton("Turn OFF")
             self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
+                QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 8px; border-radius: 4px; }
                 QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
             """)
         else:
             self.ipv6_toggle_btn = QPushButton("Turn ON")
             self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
+                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 8px; border-radius: 4px; }
                 QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
             """)
         layout.addWidget(self.ipv6_toggle_btn)
@@ -283,25 +413,26 @@ class NetworkToolsWindow(QWidget):
         ipv6_warning.setStyleSheet("color: #ff6b6b; font-size: 10px;")
         layout.addWidget(ipv6_warning)
 
-        layout.addSpacing(10)
+        layout.addSpacing(4)
         self.traffic_label = QLabel("📊 TRAFFIC | UP: 0.0 KB/s | DOWN: 0.0 KB/s")
         self.traffic_label.setStyleSheet("color: #50fa7b; font-family: 'Consolas'; font-size: 12px;")
         layout.addWidget(self.traffic_label)
+        layout.addStretch(0)
 
+        # лог — снизу, растёт с окном, скролла нигде нет
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
-        layout.addWidget(self.log_area)
-        
-        scroll_content.setLayout(layout)
-        scroll.setWidget(scroll_content)
-        
-        main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.addWidget(scroll)
-        self.setLayout(main_layout)
+        self.log_area.setMinimumHeight(150)
+
+        self.log_area.setStyleSheet("""
+            QTextEdit { background-color: rgba(18, 11, 26, 0.9); border: 1px solid rgba(108, 92, 231, 0.4); font-family: 'Consolas'; font-size: 11px; color: #c8c8d8; }
+        """)
+        layout.addWidget(self.log_area, 1)
+        self.setLayout(layout)
 
         self.edit_list_btn.clicked.connect(self.open_list_editor)
         self.edit_ignore_btn.clicked.connect(self.open_ignore_editor)
+        self.repair_btn.clicked.connect(self.run_repair)
         self.ping_btn.clicked.connect(self.run_ping_logic)
         self.trace_btn.clicked.connect(lambda: tools.run_tracert(self.host_input.text()) if self.host_input.text() else None)
         self.test_dns_btn.clicked.connect(self.run_custom_dns_test)
@@ -373,6 +504,44 @@ class NetworkToolsWindow(QWidget):
             self.log_append(f"[Discord] {result}")
         threading.Thread(target=_task, daemon=True).start()
 
+    def run_repair(self):
+        self.repair_btn.setEnabled(False)
+        self.log_append("\n" + "=" * 40)
+        self.log_append("🛠️  Diagnostics & Repair started...")
+        self.log_append("=" * 40)
+
+        def _ask(question):
+            from PyQt5.QtWidgets import QMessageBox
+            answer = [False]
+            done = threading.Event()
+
+            def _show():
+                ret = QMessageBox.question(
+                    self, "Sakura Flow", question,
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                answer[0] = (ret == QMessageBox.Yes)
+                done.set()
+
+            QMetaObject.invokeMethod(self, "_ask_from_thread",
+                                     Qt.QueuedConnection, Q_ARG(object, _show))
+            done.wait(15)
+            return answer[0]
+
+        def _task():
+            try:
+                QMetaObject.invokeMethod(self, "_spinner_bridge",
+                                         Qt.QueuedConnection,
+                                         Q_ARG(object, self.start_spinner))
+                repair.diagnose_and_repair(on_log=self.log_append, on_confirm=_ask)
+            finally:
+                QMetaObject.invokeMethod(self, "_spinner_bridge",
+                                         Qt.QueuedConnection,
+                                         Q_ARG(object, self.stop_spinner_final))
+                QMetaObject.invokeMethod(self.repair_btn, "setEnabled",
+                                         Qt.QueuedConnection, Q_ARG(bool, True))
+
+        threading.Thread(target=_task, daemon=True).start()
+
     def copy_secret(self):
         secret = self.tg_secret_input.text().strip()
         QApplication.clipboard().setText(secret)
@@ -440,12 +609,53 @@ class NetworkToolsWindow(QWidget):
 
     def closeEvent(self, event):
         global tools_window
+        self.timer.stop()
+        if getattr(self, "spin_timer", None) is not None:
+            try:
+                self.spin_timer.stop()
+                self.spin_timer.deleteLater()
+            except Exception:
+                pass
+        self.log_area.clear()
         tools_window = None
         event.accept()
+
+    @pyqtSlot(object)
+    def _ask_from_thread(self, show_fn):
+        """Runs on the GUI thread: executes the QMessageBox and signals back."""
+        try:
+            show_fn()
+        except Exception as e:
+            logging.error(f"[ask] {e}")
 
     def update_stats(self):
         up, down = tools.get_traffic_stats()
         self.traffic_label.setText(f"TRAFFIC | UP: {up} KB/s | DOWN: {down} KB/s")
+        self._ipv6_check_accum = getattr(self, "_ipv6_check_accum", 0) + 1
+        if self._ipv6_check_accum >= 5:
+            self._ipv6_check_accum = 0
+            self._sync_ipv6_btn()
+
+    def _sync_ipv6_btn(self):
+        """Keep the IPv6 toggle in sync with the REAL system state (button must not lie)."""
+        real_enabled = repair.real_ipv6_enabled()
+        if real_enabled == self._ipv6_on:
+            return
+        self._ipv6_on = real_enabled
+        state.save_state(ipv6_enabled=real_enabled)
+        if real_enabled:
+            self.ipv6_toggle_btn.setText("Turn OFF")
+            self.ipv6_toggle_btn.setStyleSheet("""
+                QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
+                QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
+            """)
+        else:
+            self.ipv6_toggle_btn.setText("Turn ON")
+            self.ipv6_toggle_btn.setStyleSheet("""
+                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
+                QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
+            """)
+        self.log_append(f"IPv6 реальное состояние обновлено: {'включен' if real_enabled else 'выключен'}", "green")
 
     def run_ping_logic(self):
         h = self.host_input.text().strip()
