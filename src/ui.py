@@ -135,6 +135,12 @@ class NetworkToolsWindow(QWidget):
             try:
                 QMetaObject.invokeMethod(self.log_area, "append",
                                          Qt.QueuedConnection, Q_ARG(str, html))
+                # Спам строк (MTProto toggle, pings, DNS-тесты и т.п.) идёт через
+                # append и не проходит через спиннерные слоты. Трим тоже должен
+                # выполниться в GUI-потоке ПОСЛЕ append (queued), иначе работаем с
+                # QTextEdit из рабочего потока (риск) и лог копит без лимита.
+                QMetaObject.invokeMethod(self, "_trim_log",
+                                         Qt.QueuedConnection)
             except Exception as e:
                 logging.error(f"[spinner] append failed: {e}")
 
@@ -182,6 +188,7 @@ class NetworkToolsWindow(QWidget):
 
     _MAX_LOG_BLOCKS = 4000
 
+    @pyqtSlot()
     def _trim_log(self):
         """Не даём логу-документу расти бесконечно: если строк (блоков) стало больше
         лимита, удаляем верхнюю часть. Иначе QTextDocument копит все строки в памяти
@@ -619,6 +626,19 @@ class NetworkToolsWindow(QWidget):
         self.log_area.clear()
         tools_window = None
         event.accept()
+
+    def hideEvent(self, event):
+        """Окно прячется (в трей), но НЕ удаляется — объект NetworkToolsWindow
+        живёт между открытиями, а QTextEdit (log_area) копит весь лог после fix.
+        clear() освобождает QTextDocument, чтобы память не «застревала» на +12 МБ
+        при повторных открытиях меню без полного закрытия приложения."""
+        try:
+            if getattr(self, "spin_timer", None) is not None:
+                self.spin_timer.stop()
+            self.log_area.clear()
+        except Exception:
+            pass
+        super().hideEvent(event)
 
     @pyqtSlot(object)
     def _ask_from_thread(self, show_fn):

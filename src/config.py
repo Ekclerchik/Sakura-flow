@@ -16,7 +16,7 @@ else:
     BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Пути к файлам (теперь они будут искаться рядом с SakuraFlow.exe)
-ICON_PATH = BASE_DIR / "icons" / "moonstone.ico"
+ICON_PATH = BASE_DIR / "icons" / "sakura.ico"
 CHECK_ICON_PATH = BASE_DIR / "icons" / "check.ico"
 BAT_DIR = BASE_DIR / "zapret"
 

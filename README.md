@@ -30,7 +30,7 @@
 ##  Сборка
 Для создания автономного .exe используйте следующую команду:
 ```bash
-pyinstaller --onedir --noconfirm --noconsole --name SakuraFlow --manifest manifest.xml --add-data "icons;icons" --add-data "zapret;zapret" --add-data "src;src" --icon=icons/moonstone.ico --version-file=version.py src/main.py
+pyinstaller --onedir --noconfirm --noconsole --name SakuraFlow --manifest manifest.xml --add-data "icons;icons" --add-data "zapret;zapret" --add-data "src;src" --icon=icons/sakura.ico --version-file=version.py src/main.py
 ```
 
 ##  Благодарности

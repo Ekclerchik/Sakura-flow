@@ -1716,7 +1716,11 @@ def diagnose_and_repair(on_log=None, on_confirm=None):
         return False
 
     def raw_dump():
-        """Сырой вывод системных команд — пугает, но инфополезно."""
+        """Сырой вывод системных команд — пугает, но инфополезно.
+        Выводим ПОСТРОЧНО (каждая строка отдельным блоком), а не одним
+        гигантским куском с \n внутри: иначе QTextDocument дробит его на
+        десятки блоков, спиннер дублирует, а _trim_log (счёт по блокам)
+        не успевает — лог раздувается и память не возвращается."""
         log("─" * 46)
         log("RAW SYSINFO (raw output — по нему диагностировал):")
         for cmd, label in (
@@ -1732,7 +1736,12 @@ def diagnose_and_repair(on_log=None, on_confirm=None):
             body = ""
             if r:
                 body = (r.stdout or "").strip() or (r.stderr or "").strip() or "(empty)"
-            log(f"\n[{label}]  $ {cmd}\n{body}")
+            log(f"[{label}]  $ {cmd}")
+            if body == "(empty)":
+                log("(empty)")
+            else:
+                for line in body.splitlines():
+                    log(line)
 
     def flush_steps():
         """Вывести в UI накопленный чек-лист проверок (diag.add попадал только
