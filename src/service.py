@@ -13,31 +13,38 @@ except ImportError:
     from src.config import SERVICE_NAME, BAT_DIR, CONSOLE_ENCODING
 
 
-BAT_NAME = "_zapret_service.bat"
-
-
-def _write_bat(executable, args):
-    bat_path = BAT_DIR / BAT_NAME
-    bat_path.parent.mkdir(parents=True, exist_ok=True)
-    bin_dir = Path(executable).parent
-    # winws стартует с CWD=bin_dir; логируем в winws.log рядом со стратегией
-    # (абсолютный путь — чтобы проверки ремонта находили его из zapret\)
-    log_path = bin_dir.parent / "winws.log"
-    bat_content = (f'@cd /d "{bin_dir}" && "{executable}" {args} '
-                   f'> "{log_path}" 2>&1')
-    bat_path.write_text(bat_content, encoding="utf-8")
-    logging.info(f"Written service bat: {bat_path}")
-    return bat_path
+# sc.exe query выдаёт статус на языке ОС (RU: РАБОТАЕТ/ОСТАНОВЛЕН).
+_RUN_RE = re.compile(r"\b(RUNNING|РАБОТАЕТ)\b", re.IGNORECASE)
+_STOP_RE = re.compile(r"\b(STOPPED|ОСТАНОВЛЕН\w*)\b", re.IGNORECASE)
 
 
 def _wait_service_stopped(timeout=8):
     start = time.time()
     while time.time() - start < timeout:
         result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
-        if result and "STOPPED" in result.stdout:
+        # 1060 — служба не существует (уже удалена) — считаем остановленной
+        if result and (result.returncode == 1060 or (result.stdout and _STOP_RE.search(result.stdout))):
             return True
         time.sleep(0.5)
     return False
+
+
+def _wait_service_running(timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
+        if result and (result.stdout and _RUN_RE.search(result.stdout)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def windivert_stuck():
+    """True, если драйвер WinDivert завис в STOP_PENDING — winws не сможет
+    стартовать до перезагрузки ПК. Останавливать его принудительно нельзя
+    (гонка при остановке вешает драйвер), но знать о зависании нужно."""
+    result = run_cmd('sc.exe query "WinDivert"')
+    return bool(result) and "STOP_PENDING" in (result.stdout or "")
 
 
 def restart_service(batch_path, display_version):
@@ -45,16 +52,7 @@ def restart_service(batch_path, display_version):
         stop_service()
         _wait_service_stopped()
         delete_service()
-    create_service(batch_path, display_version)
-    start_service(batch_path, display_version)
-
-    for _ in range(10):
-        time.sleep(0.5)
-        result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
-        if result and "RUNNING" in result.stdout:
-            return True
-    logging.error("Service failed to reach RUNNING state")
-    return False
+    return start_service(batch_path, display_version)
 
 
 def run_cmd(cmd, timeout=None):
@@ -141,13 +139,20 @@ def parse_bat_file(batch_path):
 
 def create_service(batch_path, display_version):
     executable, args = parse_bat_file(batch_path)
-    bat_path = _write_bat(executable, args)
     service_display = f"Sakura Flow version[{display_version}]"
-    bin_path_value = f'cmd.exe /c "{bat_path}"'
+    bin_dir = Path(executable).parent
+    # winws стартует с CWD=bin_dir и логируется в winws.log рядом со стратегией
+    # (абсолютный путь — чтобы проверки ремонта находили его из zapret\)
+    log_path = bin_dir.parent / "winws.log"
+    # Служба выполняется инлайн-командой cmd.exe (редirect в winws.log сохранён),
+    # БЕЗ пакетного файла. Раньше здесь создавался _zapret_service.bat, который cmd
+    # держал открытым всё время работы winws → файл нельзя было удалить/перезаписать
+    # до остановки службы или перезагрузки ПК. Теперь лочить нечего.
+    cmd_line = f'cmd.exe /c "cd /d "{bin_dir}" && "{executable}" {args} > "{log_path}" 2>&1"'
 
     cmd_args = [
         'sc.exe', 'create', SERVICE_NAME, 'start=', 'auto',
-        'displayname=', service_display, 'binPath=', bin_path_value
+        'displayname=', service_display, 'binPath=', cmd_line
     ]
     subprocess.run(cmd_args, capture_output=True, text=True, encoding=CONSOLE_ENCODING)
 
@@ -157,8 +162,18 @@ def start_service(batch_path, display_version):
         stop_service()
         delete_service()
 
+    # если драйвер завис в STOP_PENDING — winws не стартует до перезагрузки ПК;
+    # честно сообщаем, а не молча создаём мёртвую службу
+    if windivert_stuck():
+        logging.error("[SERVICE] WinDivert завис в STOP_PENDING — winws не запустится до перезагрузки ПК")
+        return False
+
     create_service(batch_path, display_version)
     run_cmd(f'sc.exe start "{SERVICE_NAME}"')
+    ok = _wait_service_running()
+    if not ok:
+        logging.error("[SERVICE] Service failed to reach RUNNING state after start")
+    return ok
 
 
 def stop_service():
@@ -167,7 +182,10 @@ def stop_service():
         # таймауты: sc.exe команды могут висеть (напр. драйвер, держимый процессом)
         run_cmd(f'sc.exe stop "{SERVICE_NAME}"', timeout=30)
         run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
-        run_cmd('sc.exe stop "WinDivert"', timeout=10)
+        # WinDivert принудительно НЕ останавливаем: гонка при остановке подвешивает
+        # драйвер в STOP_PENDING, после чего winws не может стартовать до ребута
+        if windivert_stuck():
+            logging.error("[SERVICE] WinDivert завис в STOP_PENDING — потребуется перезагрузка ПК")
     else:
         return None
 

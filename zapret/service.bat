@@ -389,9 +389,7 @@ if "%LOCAL_VERSION%"=="%GITHUB_VERSION%" (
 
 echo New version available: %GITHUB_VERSION%
 echo Release page: %GITHUB_RELEASE_URL%%GITHUB_VERSION%
-
-echo Opening the download page...
-start "" "%GITHUB_DOWNLOAD_URL%"
+echo Download it manually if you want to update.
 
 
 if "%1"=="soft" exit 

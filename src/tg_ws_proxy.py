@@ -580,6 +580,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
 
     def client_cb(r, w):
         task = asyncio.create_task(_handle_client(r, w, secret_bytes))
+        task._sakura_writer = w
         _client_tasks.add(task)
         task.add_done_callback(_client_tasks.discard)
 
@@ -659,12 +660,21 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
                 if stop_task in done:
                     log.info(f"[DEBUG] stop_event triggered, closing server")
                     server.close()
-                    await server.wait_closed()
-                    # Cancel all pending client tasks
+                    # Закрываем клиентские транспорты ДО wait_closed: иначе
+                    # wait_closed() ждёт connection_lost каждого активного
+                    # соединения без таймаута, а Telegram держит сокеты открытыми
+                    # → стоп висит секундами.
                     for task in list(_client_tasks):
+                        w = getattr(task, '_sakura_writer', None)
+                        if w is not None:
+                            try:
+                                w.transport.abort()
+                            except Exception:
+                                pass
                         if not task.done():
                             task.cancel()
                     _client_tasks.clear()
+                    await server.wait_closed()
                     _ws_pool.reset()
                     if not serve_task.done():
                         serve_task.cancel()
@@ -687,6 +697,16 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             await log_stats_task
         except asyncio.CancelledError:
             pass
+        # Задачи WS-пула (_refill/_connect_one) висят с таймаутами до 8с и без
+        # отмены loop закрывается с «pending» → шум "Task was destroyed...".
+        # Отменяем все прочие задачи и ждём их, чтобы шатдаун был чистым.
+        cur = asyncio.current_task()
+        pending = [t for t in asyncio.all_tasks()
+                   if t is not cur and not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     _server_instance = None
 
 

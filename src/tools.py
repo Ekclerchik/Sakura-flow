@@ -1,5 +1,4 @@
 import subprocess
-import psutil
 import socket
 import threading
 import time
@@ -8,8 +7,20 @@ import asyncio
 import signal
 import re
 import os
+import json
 from pathlib import Path
-from ping3 import ping
+
+# psutil/ping3 — опциональные зависимости: на «убитом» компе их может не быть,
+# приложение должно ЗАПУСТИТЬСЯ в любом случае (функции сами отдадут 0/None)
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    from ping3 import ping
+except ImportError:
+    ping = None
 
 try:
     from .config import BASE_DIR, FILE_ENCODING
@@ -22,7 +33,7 @@ except ImportError:
 
 _last_io = None
 LIST_PATH = BASE_DIR / "zapret" / "lists" / "list-general.txt"
-EXCLUDE_LIST_PATH = BASE_DIR / "zapret" / "lists" / "list-exclude-user.txt"
+EXCLUDE_LIST_PATH = BASE_DIR / "zapret" / "lists" / "list-exclude.txt"
 
 def is_mtproto_enabled():
     return state.load_state().get("mtproto_enabled", False)
@@ -34,13 +45,38 @@ _proxy_lock = threading.Lock()
 
 def get_ping(host):
     try:
-        p = ping(host, unit='ms')
-        if p:
-            return round(p, 2)
+        if ping is not None:
+            p = ping(host, unit='ms')
+            if p:
+                return round(p, 2)
         else:
-            return 'Timeout'
-    except:
-        return 'Error'
+            return _ping_shell(host)
+    except Exception:
+        try:
+            return _ping_shell(host)
+        except Exception:
+            return 'Error'
+    return 'Timeout'
+
+
+def _ping_shell(host, timeout_ms=1500):
+    """Fallback-пинг без ping3: системный ping.exe (работает везде, где есть TCP/IP)."""
+    try:
+        r = subprocess.run(
+            f'ping -n 1 -w {timeout_ms} {host}',
+            shell=True, capture_output=True, text=True, timeout=timeout_ms // 1000 + 2,
+            errors="replace"
+        )
+        m = re.search(r"[=<](\\d+)ms", (r.stdout or "") + (r.stderr or ""))
+        if m:
+            return float(m.group(1))
+        if "TTL" in r.stdout:
+            return 1.0
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    return 'Timeout'
 
 
 def run_tracert(host):
@@ -200,7 +236,8 @@ def stop_process_by_port(port):
 
 def start_mtproto_proxy(port=1080, host='127.0.0.1', secret=None):
     global _proxies
-    
+
+    port = int(port)
     key = (host, port)
     
     with _proxy_lock:
@@ -264,6 +301,7 @@ def start_mtproto_proxy(port=1080, host='127.0.0.1', secret=None):
     import asyncio
     stop_event = asyncio.Event()
     thread_error: list = [None]
+    loop_ref: list = [None]
     
     def _run():
         loop = None
@@ -274,25 +312,13 @@ def start_mtproto_proxy(port=1080, host='127.0.0.1', secret=None):
             proxy_config.secret = secret
             proxy_config.dc_redirects = dc_opt
             proxy_config.fake_tls_domain = ''
-            proxy_config.fallback_cfproxy = True
-            proxy_config.fallback_cfproxy_priority = True
-            proxy_config.cfproxy_user_domain = ''
-            
-            # Initialize balancer with CF proxy domains
-            try:
-                from src.proxy.balancer import balancer
-                from src.proxy.config import CFPROXY_DEFAULT_DOMAINS
-                balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
-            except ImportError:
-                from proxy.balancer import balancer
-                from proxy.config import CFPROXY_DEFAULT_DOMAINS
-                balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
-            
+
             logging.info(f"[MTPROTO] proxy_config set: {proxy_config.port}:{proxy_config.host}")
             
             logging.info(f"[MTPROTO] Creating event loop...")
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            loop_ref[0] = loop
             logging.info(f"[MTPROTO] Event loop set, calling run...")
             
             try:
@@ -346,6 +372,7 @@ def start_mtproto_proxy(port=1080, host='127.0.0.1', secret=None):
         _proxies[key] = {
             'thread': thread,
             'stop_event': stop_event,
+            'loop_ref': loop_ref,
             'port': port,
             'host': host,
             'running': True
@@ -360,6 +387,7 @@ def stop_mtproto_proxy(port, host='127.0.0.1'):
     
     logging.info(f"[MTPROTO] stop_mtproto_proxy called: {host}:{port}")
     
+    port = int(port)
     key = (host, port)
     
     proxy = None
@@ -370,8 +398,18 @@ def stop_mtproto_proxy(port, host='127.0.0.1'):
         try:
             stop_evt = proxy.get('stop_event')
             thread = proxy.get('thread')
+            loop_ref = proxy.get('loop_ref')
             if stop_evt:
-                stop_evt.set()
+                # asyncio.Event.set() из чужого потока НЕ будит event loop: цикл
+                # просыпается только по своим таймерам (stats каждые 60с), всё это
+                # время порт продолжает слушать → закрывается минутами, а кнопка
+                # остаётся «STOP». call_soon_threadsafe ставит set() в loop потока
+                # прокси — остановка мгновенная.
+                loop = (loop_ref or [None])[0]
+                if loop and not loop.is_closed():
+                    loop.call_soon_threadsafe(stop_evt.set)
+                else:
+                    stop_evt.set()
             if thread:
                 thread.join(timeout=3)
         except Exception as e:
@@ -379,11 +417,17 @@ def stop_mtproto_proxy(port, host='127.0.0.1'):
         
         logging.info(f"[MTPROTO] Proxy {host}:{port} stopped")
     
+    # Ждём, пока порт реально освободится: умирающий поток слушает ещё пару
+    # мгновений, и без ожидания кнопка после стопа продолжала бы показывать
+    # «STOP» из-за ложного «ещё слушает».
+    _wait_port_free(port)
+    
     return True
 
 
 def is_mtproto_proxy_running(port=1080, host='127.0.0.1'):
     with _proxy_lock:
+        port = int(port)
         key = (host, port)
         proxy = _proxies.get(key)
         
@@ -400,6 +444,9 @@ def is_mtproto_proxy_running(port=1080, host='127.0.0.1'):
 
 
 def _check_mtproto_traffic(port):
+    # Только прямое TCP-подключение. psutil-фолбэк по ESTABLISHED/LISTENING
+    # убираем: после остановки прокси «висящий» клиентский сокет в состоянии
+    # ESTABLISHED даёт ложное «работает», и кнопка STOP не отрисовывалась.
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.5)
@@ -409,14 +456,34 @@ def _check_mtproto_traffic(port):
             return True
         except (ConnectionRefusedError, OSError):
             sock.close()
-            for conn in psutil.net_connections(kind='inet'):
-                if conn.laddr and conn.laddr.port == port:
-                    if conn.status == 'ESTABLISHED' or conn.status == 'LISTENING':
-                        return True
             return False
     except Exception as e:
         logging.warning(f"[MTPROTO] _check_mtproto_traffic error: {e}")
         return False
+
+
+def _port_busy(port):
+    """True, если порт реально слушается (или занят процессом)."""
+    try:
+        if psutil is not None:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr and conn.laddr.port == port and conn.status == 'LISTEN':
+                    return True
+        return _check_mtproto_traffic(port)
+    except Exception as e:
+        logging.warning(f"[MTPROTO] _port_busy error: {e}")
+        return _check_mtproto_traffic(port)
+
+
+def _wait_port_free(port, timeout=5.0):
+    """Ждём, пока порт освободится (не слушается). Возвращает True, если освободился."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_busy(port):
+            return True
+        time.sleep(0.2)
+    logging.warning(f"[MTPROTO] Port {port} не освободился за {timeout}s")
+    return False
 
 
 def is_mtproto_running():
@@ -424,23 +491,47 @@ def is_mtproto_running():
         return any(p.get('thread') and p['thread'].is_alive() for p in _proxies.values())
 
 
-def is_winws_running():
+def _tasklist_winws_running():
+    """Проверка через tasklist — видит winws.exe даже там, где psutil молчит
+    о процессах с недоступными атрибутами (AccessDenied / пустое имя / гонка
+    с завершением процесса)."""
     try:
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and proc.info['name'].lower() == 'winws.exe':
-                return True
-    except Exception as e:
-        logging.warning(f"[winws] Check error: {e}")
-    return False
+        r = subprocess.run('tasklist /FI "IMAGENAME eq winws.exe"',
+                           shell=True, capture_output=True, text=True, errors="replace",
+                           timeout=10)
+        return "winws.exe" in (r.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def is_winws_running():
+    """winws.exe запущен? Трей и логи опираются на это. psutil может тихо
+    пропустить живой процесс и вернуть False (симптом «в трее сам вырубился,
+    а в диспетчере есть»), поэтому при отсутствии матча ВСЕГДА перепроверяем
+    через tasklist — он видал все процессы на машине."""
+    try:
+        if psutil is not None:
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and proc.info['name'].lower() == 'winws.exe':
+                    return True
+    except Exception:
+        pass
+    return _tasklist_winws_running()
 
 
 def is_ipv6_disabled():
     return not _is_ipv6_enabled_actual()
 
 
+def real_ipv6_enabled():
+    """Реальное состояние IPv6 по активным интерфейсам (не только реестр)."""
+    return _is_ipv6_enabled_actual()
+
+
 def _is_ipv6_enabled_actual():
     """Реальная проверка: IPv6 считается включенным, если есть хотя бы один
-    активный (connected/up) IPv6-интерфейс, кроме loopback."""
+    активный IPv6-интерфейс, кроме loopback. Статус netsh локален:
+    EN: connected/up, RU: Подключено/Активн — парсим оба варианта."""
     try:
         result = subprocess.run(
             ['netsh', 'interface', 'ipv6', 'show', 'interfaces'],
@@ -448,12 +539,12 @@ def _is_ipv6_enabled_actual():
         )
         if result.stdout:
             for line in result.stdout.splitlines():
-                if re.search(r'\b(connected|up)\b', line, re.IGNORECASE):
+                if re.search(r'\b(connected|up|подключ|актив)', line, re.IGNORECASE):
                     parts = line.split()
                     # пропускаем заголовки и итоги: реальная строка начинается с ID интерфейса
                     if len(parts) >= 4 and parts[0].isdigit() and int(parts[0]) > 1:
                         return True
-            # если строки не распарсились (русская локаль), падаем на реестр
+            # если строки не распарсились, падаем на реестр
         return _ipv6_registry_enabled()
     except Exception:
         return _ipv6_registry_enabled()
@@ -507,6 +598,40 @@ def enable_ipv6():
         return result.returncode == 0
     except Exception as e:
         logging.error(f"[IPv6] Error: {e}")
+        return False
+
+
+def get_ipv6_interface_names():
+    """Имена интерфейсов (idx>1, кроме loopback) из netsh ipv6 show interface."""
+    names = []
+    try:
+        result = subprocess.run(
+            ['netsh', 'interface', 'ipv6', 'show', 'interface'],
+            capture_output=True, text=True, errors="replace", shell=True)
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].isdigit() and int(parts[0]) > 1:
+                    names.append(" ".join(parts[4:]))
+    except Exception as e:
+        logging.error(f"[IPv6] interface list error: {e}")
+    return names
+
+
+def set_ipv6_interface(name, enabled):
+    """Мгновенно вкл/выкл IPv6 на одном интерфейсе (netsh). Реестра мало —
+    DisabledComponents срабатывает только после перезагрузки, а интерфейс до
+    этого продолжает держать IPv6-адреса и путает проверки реального состояния."""
+    try:
+        r = subprocess.run(
+            ['netsh', 'interface', 'ipv6', 'set', 'interface', name,
+             'enabled' if enabled else 'disabled'],
+            capture_output=True, text=True, errors="replace", shell=True)
+        ok = r.returncode == 0
+        logging.info(f"[IPv6] Interface {name!r} {'enabled' if enabled else 'disabled'}: {ok}")
+        return ok
+    except Exception as e:
+        logging.error(f"[IPv6] set interface {name!r} error: {e}")
         return False
 
 
@@ -598,3 +723,150 @@ def set_ipset_mode(mode):
         logging.error(f"[IPSet] Verification failed: expected {mode}, got {get_ipset_status()}")
         return False
     return True
+
+
+# Стратегии, подобранные под конкретного провайдера: ключ — код провайдера,
+# кортеж — токены поиска в имени .bat и в ответах DNS (o-o.myaddr / Team Cymru).
+PROVIDER_STRATEGY_TOKENS = {
+    "beeline": ("beeline", "vimpel", "вымпел", "билайн"),
+    "ertelecom": ("er-telecom", "ertc", "interzet", "дом.ру", "dom.ru"),
+    "rostelecom": ("rostelecom", "rtk", "онлайм", "ртк"),
+    "mts": ("mts", "мтс", "комстар", "mgts"),
+    "megafon": ("megafon", "мегафон"),
+    "yota": ("yota", "йота"),
+    "ttk": ("ttk", "ттк"),
+}
+
+# AS-номера крупных РФ-операторов (Cymru отдаёт их всегда, имени может не быть)
+_ASN_PROVIDERS = {
+    "3216": "beeline",
+    "23577": "beeline",
+    "12389": "rostelecom",
+    "12668": "rostelecom",
+    "16345": "rostelecom",
+    "41733": "ertelecom",
+    "41729": "ertelecom",
+    "8359": "mts",
+    "31133": "megafon",
+    "208722": "megafon",
+    "4156": "ttk",
+    "28917": "ttk",
+}
+
+_PROVIDER_CACHE_TTL = 30 * 24 * 3600
+
+
+def _nslookup(args):
+    try:
+        p = subprocess.Popen(
+            ["nslookup"] + args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=0x08000000,
+        )
+        return p.communicate(timeout=6)[0].decode("utf-8", "ignore")
+    except Exception as e:
+        logging.warning(f"[PROVIDER] nslookup {' '.join(args)} failed: {e}")
+        return ""
+
+
+def _public_ip_dns():
+    """Публичный IP без сторонних сайтов: myip.opendns.com отдаёт наш IP как
+    A-запись (DNS-only). Фолбэк — /24 из edns0-client-subnet Google TXT
+    (для ASN-определения сети достаточно). Возвращает строку IP или None."""
+    raw = _nslookup(["myip.opendns.com", "208.67.222.222"])
+    if not raw:
+        raw = _nslookup(["myip.opendns.com", "208.67.220.220"])
+    addrs = re.findall(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", raw)
+    for a in addrs:
+        if a in ("208.67.222.222", "208.67.220.220"):
+            continue
+        if a.startswith(("10.", "192.168.", "169.254.", "127.")):
+            continue
+        octets = [int(x) for x in a.split(".")]
+        if 0 < octets[0] < 224 and not (octets[0] == 172 and 16 <= octets[1] <= 31):
+            return a
+    # фолбэк: сеть из Google TXT (edns0-client-subnet X.X.X.0/24)
+    g = _nslookup(["-q=TXT", "o-o.myaddr.l.google.com", "8.8.8.8"])
+    m = re.search(r"edns0-client-subnet\s+(\d{1,3}\.\d{1,3}\.\d{1,3})\.0/24", g)
+    if m:
+        return m.group(1) + ".0"
+    return None
+
+
+def _asn_via_cymru(public_ip):
+    """ASN/название оператора по IP через DNS-версию WHOIS (Team Cymru origin.asn).
+    Cymru принимает и точный IP, и /24 (последний октет .0)."""
+    rev = ".".join(public_ip.split(".")[::-1])
+    return _nslookup(["-q=TXT", f"{rev}.origin.asn.cymru.com", "8.8.8.8"])
+
+
+def _provider_from_text(text):
+    """Провайдер по токенам в тексте (имя оператора) или по ASN из Cymru."""
+    low = text.lower()
+    for key, tokens in PROVIDER_STRATEGY_TOKENS.items():
+        if any(t in low for t in tokens):
+            return key
+    m = re.search(r"(?:\A|[^\d])(\d{4,6})\s*\|", low)
+    if m and m.group(1) in _ASN_PROVIDERS:
+        return _ASN_PROVIDERS[m.group(1)]
+    return None
+
+
+def detect_provider():
+    """Определяет провайдера интернет БЕЗ сторонних сайтов, только по DNS:
+    1) публичный IP через myip.opendns.com (или /24 через Google TXT);
+    2) ASN/оператор через Team Cymru origin.asn (мэппинг по ASN + токены имени);
+    3) подстраховка — TXT o-o.myaddr.l.google.com. Всё по UDP 53, winws/DPI
+    это не режут. Кэш в state на 12 часов."""
+    st = state.load_state()
+    cached = st.get("isp_provider", "")
+    ts = st.get("isp_provider_ts", 0)
+    if cached and isinstance(ts, (int, float)) and time.time() - ts < _PROVIDER_CACHE_TTL:
+        return cached or None
+
+    out = ""
+    public_ip = _public_ip_dns()
+    if public_ip:
+        out += " " + _asn_via_cymru(public_ip)
+    else:
+        logging.warning("[PROVIDER] public IP not resolved (OpenDNS+Google TXT)")
+
+    provider = _provider_from_text(out)
+    if not provider:
+        out = " " + _nslookup(["-q=TXT", "o-o.myaddr.l.google.com", "8.8.8.8"])
+        provider = _provider_from_text(out)
+
+    logging.info(f"[PROVIDER] ip={public_ip} detected={provider or 'unknown'} "
+                 f"raw={out.strip()[:200]}")
+    state.save_state(isp_provider=provider, isp_provider_ts=time.time())
+    return provider
+
+
+def _is_real_strategy(name):
+    """Служебные .bat (Windows-служба, заготовки) стратегией не считаются."""
+    low = name.lower()
+    return low not in ("service.bat", "general.bat", "_zapret_service.bat")
+
+
+def _strategy_owner(name):
+    """Какому провайдеру принадлежит стратегия судя по имени .bat (или None)."""
+    low = name.lower()
+    for prov, tokens in PROVIDER_STRATEGY_TOKENS.items():
+        if any(t in low for t in tokens):
+            return prov
+    return None
+
+
+def pick_strategy_bat(candidates, last_bat):
+    """Логика выбора стратегии при запуске/старте: ручной выбор (last_bat) держится
+    только если файл ещё существует и это реальная стратегия. Иначе — первая
+    реальная стратегия (как в 3.3.9). Без DNS/провайдер-детекции."""
+    if last_bat:
+        for b in candidates:
+            if b.stem == last_bat and _is_real_strategy(b.name):
+                return b
+    for b in candidates:
+        if _is_real_strategy(b.name):
+            logging.info(f"[STRATEGY] default strategy: {b.name}")
+            return b
+    return None

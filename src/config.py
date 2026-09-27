@@ -21,8 +21,12 @@ CHECK_ICON_PATH = BASE_DIR / "icons" / "check.ico"
 BAT_DIR = BASE_DIR / "zapret"
 
 # --- ПЕРЕИМЕНОВЫВАЕМ ТУТ ---
-LOG_FILE = BASE_DIR / "sakura_flow.log"
-STATE_FILE = BASE_DIR / "sakura_state.json"
+# Все рабочие файлы (лог, краш, состояние) — в отдельной папке, а не рядом с exe
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+LOG_FILE = DATA_DIR / "sakura_flow.log"
+STATE_FILE = DATA_DIR / "sakura_state.json"
+CRASH_FILE = DATA_DIR / "sakura_flow.crash"
 # ---------------------------
 
 # Кодировка для вывода консольных команд Windows (sc.exe и т.д.)

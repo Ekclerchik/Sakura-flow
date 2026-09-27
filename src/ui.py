@@ -1,16 +1,14 @@
 """UI/Tray interface functions for Sakura Flow."""
+import os
 import subprocess
-import re
 import sys
 import threading
-import time
 import ctypes
 import logging
-from pathlib import Path
 
-from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QScrollArea)
-from PyQt5.QtGui import QDesktopServices, QIcon, QFont, QCursor
-from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot
+from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QShortcut)
+from PyQt5.QtGui import QDesktopServices, QIcon, QFont, QCursor, QPixmap, QKeySequence, QPalette, QColor
+from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot, QObject
 
 try:
     myappid = 'ekcler.sakuraflow.v1.2'
@@ -19,57 +17,235 @@ except Exception:
     pass
 
 try:
-    from .config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR
-    from . import service, autostart, state, tools, repair
+    from .config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR, LOG_FILE
+    from . import service, autostart, state, tools
 except ImportError:
-    from src.config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR
-    from src import service, autostart, state, tools, repair
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from src.config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR, LOG_FILE
+    from src import service, autostart, state, tools
+
+
+_APP_ID = "Ekcler.SakuraFlow"
+
+# Иконки меню Старт/Стоп фиксированного размера 16x16. QMenu резервирует колонку
+# иконок, ТОЛЬКО если хотя бы у одного пункта есть иконка — при выкл (QIcon())
+# колонка схлопывалась и весь текст меню «прыгал» влево (сносило табуляцию).
+_START_PLACEHOLDER = None
+_START_CHECK_ICON = None
+
+
+def _start_menu_icons():
+    global _START_PLACEHOLDER, _START_CHECK_ICON
+    if _START_PLACEHOLDER is None:
+        base = QPixmap(16, 16)
+        base.fill(Qt.transparent)
+        _START_PLACEHOLDER = QIcon(base)
+    if _START_CHECK_ICON is None:
+        pm = QPixmap()
+        if CHECK_ICON_PATH.exists():
+            pm = QPixmap(str(CHECK_ICON_PATH))
+        if not pm.isNull():
+            _START_CHECK_ICON = QIcon(pm.scaled(
+                16, 16, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+        else:
+            _START_CHECK_ICON = _START_PLACEHOLDER
+    return _START_PLACEHOLDER, _START_CHECK_ICON
+
+
+class _GuiBridge(QObject):
+    """Мост «рабочий поток → GUI-поток»: @pyqtSlot(object) исполняет callable в
+    потоке владельца (GUI). Используется воркерами (Start/Stop) для мгновенного
+    вызова _finish вместо ожидания тика 1s sync-таймера — Qt доставляет
+    QMetaCallEvent в event loop GUI-потока (QueuedConnection = thread-safe)."""
+
+    @pyqtSlot(object)
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            logging.error(f"[bridge] {e}")
 
 
 class ListEditorWindow(QWidget):
+    """Редактор листов (blocklist / ignore list).
+
+    Обычное ресайзное окно БЕЗ WindowStaysOnTopHint: подтверждение при
+    несохранённых изменениях, счётчики доменов/строк, sort&dedupe,
+    валидация строк и Ctrl+S."""
+
     def __init__(self, restart_func, list_type="general", start_menu=None, actions=None):
         super().__init__()
         self.restart_func = restart_func
         self.list_type = list_type
         self.start_menu = start_menu
         self.actions = actions
+        self._original = ""
+        self._dirty = False
         self.init_ui()
 
     def init_ui(self):
         if self.list_type == "general":
-            self.setWindowTitle("Sakura Blocklist Editor")
-            title = "Domains (one per line):"
-            default_text = tools.read_blocklist()
+            base_title = "Sakura Blocklist Editor"
+            self._file_name = "list-general.txt"
         else:
-            self.setWindowTitle("Sakura Ignore List Editor")
-            title = "Domains to ignore (one per line):"
-            default_text = tools.read_ignore_list()
-        
-        self.setFixedSize(400, 500)
+            base_title = "Sakura Ignore List Editor"
+            self._file_name = "list-exclude.txt"
+        self._base_title = base_title
+        self.setWindowTitle(base_title)
         self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.setWindowFlags(Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.Window)
+        self.resize(600, 640)
+        self.setMinimumSize(480, 520)
         self.setStyleSheet("""
             QWidget { background-color: #0f0a12; color: #ffffff; font-family: 'Segoe UI'; }
-            QTextEdit { background-color: #1a141d; border: 1px solid #3d1b28; color: #ff79c6; font-family: 'Consolas'; }
-            QPushButton { background-color: #2d1621; border: 1px solid #3d1b28; padding: 10px; border-radius: 3px; font-weight: bold; }
+            QLabel { color: #c8c8d8; }
+            QTextEdit { background-color: #1a141d; border: 1px solid #3d1b28; color: #ffffff; font-family: 'Consolas'; font-size: 12px; selection-background-color: #3d1b28; }
+            QPushButton { background-color: #2d1621; border: 1px solid #3d1b28; color: #ffffff; padding: 5px 12px; border-radius: 3px; font-weight: bold; }
             QPushButton:hover { background-color: #3d1b28; }
+            QPushButton:disabled { color: #5a5460; background-color: #1a141d; border-color: #241319; }
         """)
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel(title))
-        self.text_edit = QTextEdit()
-        self.text_edit.setPlainText(default_text)
-        layout.addWidget(self.text_edit)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
-        self.save_btn = QPushButton("SAVE AND RESTART SERVICE")
-        self.save_btn.clicked.connect(self.save_data)
-        layout.addWidget(self.save_btn)
-        self.setLayout(layout)
+        header = QHBoxLayout()
+        file_lbl = QLabel(f"Editing: {self._file_name}")
+        file_lbl.setStyleSheet("font-weight: bold; color: #ff79c6; border: none;")
+        self.count_lbl = QLabel("0 domains")
+        self.count_lbl.setAlignment(Qt.AlignRight)
+        header.addWidget(file_lbl)
+        header.addStretch(1)
+        header.addWidget(self.count_lbl)
+        root.addLayout(header)
+
+        bar = QHBoxLayout()
+        sort_btn = QPushButton("Sort && Deduplicate")
+        reload_btn = QPushButton("Reload")
+        bar.addWidget(sort_btn)
+        bar.addWidget(reload_btn)
+        bar.addStretch(1)
+        root.addLayout(bar)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setAcceptRichText(False)
+        root.addWidget(self.text_edit, 1)
+
+        self.status_lbl = QLabel("Entries: 0 | Domains: 0")
+        root.addWidget(self.status_lbl)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        save_btn = QPushButton("SAVE AND RESTART SERVICE")
+        actions.addWidget(cancel_btn)
+        actions.addWidget(save_btn)
+        root.addLayout(actions)
+
+        self.text_edit.textChanged.connect(self._on_text_changed)
+        sort_btn.clicked.connect(self.sort_dedupe)
+        reload_btn.clicked.connect(self.reload)
+        save_btn.clicked.connect(self.save_data)
+        cancel_btn.clicked.connect(self.close)
+        QShortcut(QKeySequence("Ctrl+S"), self, self.save_data)
+
+        self._load()
+
+    def _load(self):
+        if self.list_type == "general":
+            self._original = tools.read_blocklist()
+        else:
+            self._original = tools.read_ignore_list()
+        self.text_edit.setPlainText(self._original)
+        self._dirty = False
+        self._update_stats()
+        self._update_title()
+
+    def _on_text_changed(self):
+        self._dirty = self.text_edit.toPlainText() != self._original
+        self._update_stats()
+        self._update_title()
+
+    def _update_stats(self):
+        entries = 0
+        domains = 0
+        for line in self.text_edit.toPlainText().splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            entries += 1
+            if not s.startswith("#"):
+                domains += 1
+        self.status_lbl.setText(f"Entries: {entries} | Domains: {domains}")
+        self.count_lbl.setText(f"{domains} domains")
+
+    def _update_title(self):
+        self.setWindowTitle(self._base_title + (" *" if self._dirty else ""))
+
+    def sort_dedupe(self):
+        seen = set()
+        out = []
+        for line in self.text_edit.toPlainText().splitlines():
+            s = line.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        out.sort()
+        self.text_edit.setPlainText("\n".join(out))
+
+    def reload(self):
+        if self._dirty:
+            r = QMessageBox.question(self, "Reload", "Discard unsaved changes and reload from disk?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return
+        self._load()
+
+    @staticmethod
+    def _validate_lines(text):
+        bad = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if (" " in s or "\t" in s or "://" in s or "/" in s
+                    or s.startswith(".") or s.endswith(".")):
+                bad.append(s)
+        return sorted(set(bad))
 
     def save_data(self):
+        text = self.text_edit.toPlainText()
+
+        bad = self._validate_lines(text)
+        if bad:
+            shown = "\n".join(bad[:8]) + ("\n..." if len(bad) > 8 else "")
+            r = QMessageBox.warning(self, "Invalid lines",
+                                    f"These lines don't look like domains:\n\n{shown}\n\nSave anyway?",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return
+
+        domains = [l.strip() for l in text.splitlines()
+                   if l.strip() and not l.strip().startswith("#")]
+        if not domains:
+            r = QMessageBox.question(self, "Empty list",
+                                     "The list will be empty. Are you sure?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return
+
         if self.list_type == "general":
-            tools.save_blocklist(self.text_edit.toPlainText())
+            ok = tools.save_blocklist(text)
         else:
-            tools.save_ignore_list(self.text_edit.toPlainText())
+            ok = tools.save_ignore_list(text)
+        if not ok:
+            QMessageBox.critical(self, "Error", "Failed to write the list file.")
+            return
+
+        self._dirty = False
+        self._update_title()
         service.stop_service()
         service.delete_service()
         if self.start_menu and self.actions:
@@ -78,6 +254,29 @@ class ListEditorWindow(QWidget):
             self.restart_func()
         QMessageBox.information(self, "Success", "List updated! Service restarted.")
         self.close()
+
+    def closeEvent(self, event):
+        if not self._dirty:
+            super().closeEvent(event)
+            return
+        r = QMessageBox.question(self, "Unsaved changes",
+                                 "Save changes before closing?",
+                                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                 QMessageBox.Save)
+        if r == QMessageBox.Save:
+            event.ignore()
+            self.save_data()
+        elif r == QMessageBox.Discard:
+            self._dirty = False
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
 
 
 class NetworkToolsWindow(QWidget):
@@ -91,7 +290,16 @@ class NetworkToolsWindow(QWidget):
         self.ignore_list_editor = None
         self._tg_proxy_on = False
         self._mtproto_running = False
-        self._ipv6_on = not tools.is_ipv6_disabled()
+        self._ipv6_reapplied = False
+        self._ipv6_sync_warned = False
+        _saved = state.load_state()
+        # Кнопка отражает намерение пользователя: если он выключал IPv6, показываем
+        # «выключен» даже когда Windows сбросила настройку после обновления — иначе
+        # авто-возврат в _sync_ipv6_btn не сработает.
+        if _saved.get("ipv6_user_disabled"):
+            self._ipv6_on = False
+        else:
+            self._ipv6_on = not tools.is_ipv6_disabled()
         state.save_state(ipv6_enabled=self._ipv6_on)
         self.init_ui()
         
@@ -112,81 +320,39 @@ class NetworkToolsWindow(QWidget):
         self.game_filter_btn.setText(self._get_game_filter_label())
         self.ipset_btn.setText(self._get_ipset_label())
         
-        self.log_area.append("Ready!")
+        self.log_area.append("")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_stats)
         self.timer.start(1000)
 
     def log_append(self, text, color=None):
         """Thread-safe log append. color: 'green', 'red' or None. Runs on the worker
-        (repair) thread; the actual GUI write is queued to this window's slots.
-        Во время ремонта каждая фаза дописывается в лог, а НИЖНЯЯ строка лога
-        используется спиннером как статус (переписывается in-place, как \r в консоли)."""
+        thread; the actual GUI write is queued to this window's slots (thread-safe)
+        and the log is trimmed to keep QTextDocument from growing unboundedly."""
         if color:
             html = f'<span style="color: {color};">{text}</span>'
         else:
             html = text
-        if getattr(self, "_spinner_on", False):
-            # новый этап: сначала «закрепляем» текущий статус-строку как обычную,
-            # затем таймер крутится поверх новой строки
-            self._spin_log = re.sub(r"<[^>]+>", "", html)
-            self._sp_commit_line(html)
-        else:
-            try:
-                QMetaObject.invokeMethod(self.log_area, "append",
-                                         Qt.QueuedConnection, Q_ARG(str, html))
-                # Спам строк (MTProto toggle, pings, DNS-тесты и т.п.) идёт через
-                # append и не проходит через спиннерные слоты. Трим тоже должен
-                # выполниться в GUI-потоке ПОСЛЕ append (queued), иначе работаем с
-                # QTextEdit из рабочего потока (риск) и лог копит без лимита.
-                QMetaObject.invokeMethod(self, "_trim_log",
-                                         Qt.QueuedConnection)
-            except Exception as e:
-                logging.error(f"[spinner] append failed: {e}")
-
-    def _sp_commit_line(self, html):
-        """Записывает этап как отдельную строку НАД шарик-строкой (последней),
-        чтобы прогресс копился в логе, а шарик крутился на последней строке."""
         try:
-            QMetaObject.invokeMethod(self, "_sp_insert_before_last",
+            QMetaObject.invokeMethod(self.log_area, "append",
                                      Qt.QueuedConnection, Q_ARG(str, html))
+            QMetaObject.invokeMethod(self, "_trim_log",
+                                     Qt.QueuedConnection)
         except Exception as e:
-            logging.error(f"[spinner] commit failed: {e}")
-
-    @pyqtSlot(str)
-    def _sp_insert_before_last(self, html):
-        """GUI-слот: вставляет html строкой перед последней (шарик) строкой.
-        Fehl: простые строки (raw-вывод с \n и табами) вставляем insertText,
-        чтобы не давить переносы (insertHtml схлопывает \n и ломает табуляцию),
-        а цветные (<span ...>) — insertHtml, чтобы цвет не потерялся."""
-        try:
-            cur = self.log_area.textCursor()
-            doc = self.log_area.document()
-            last = doc.lastBlock()
-            cur.setPosition(last.position())
-            cur.beginEditBlock()
-            if "<sp" in html or "<b" in html or "<font" in html:
-                cur.insertHtml(html)
-            else:
-                cur.insertText(html)
-            cur.insertBlock()
-            cur.endEditBlock()
-            self._trim_log()
-            self._ensure_bottom()
-        except Exception as e:
-            logging.error(f"[spinner] insert before last: {e}")
-
-    def _ensure_bottom(self):
-        """Скроллит лог вниз только если юзер уже у низа — иначе не мешает
-        читать/крутить лог вручную во время ремонта."""
-        try:
-            sb = self.log_area.verticalScrollBar()
-            if sb.value() >= sb.maximum() - 6:
-                sb.setValue(sb.maximum())
-        except Exception:
-            pass
+            logging.error(f"[log] append failed: {e}")
 
     _MAX_LOG_BLOCKS = 4000
+
+    _MTPROTO_START_STYLE = """
+        QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 8px; border-radius: 4px; }
+        QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
+        QPushButton:disabled { background-color: rgba(120, 120, 120, 0.22); border: 1px solid rgba(170, 170, 170, 0.45); color: rgba(180, 180, 180, 0.7); }
+    """
+    _MTPROTO_STOP_STYLE = """
+        QPushButton { background-color: rgba(255, 77, 136, 0.25); border: 1px solid #ff4d88; color: #ff7aa2; font-weight: bold; padding: 8px; border-radius: 4px; }
+        QPushButton:hover { background-color: rgba(255, 122, 162, 0.35); border: 1px solid #ff7aa2; }
+        QPushButton:disabled { background-color: rgba(120, 120, 120, 0.22); border: 1px solid rgba(170, 170, 170, 0.45); color: rgba(180, 180, 180, 0.7); }
+    """
 
     @pyqtSlot()
     def _trim_log(self):
@@ -204,61 +370,6 @@ class NetworkToolsWindow(QWidget):
         except Exception as e:
             logging.error(f"[spinner] trim: {e}")
 
-    def start_spinner(self):
-        """Включает «крутящийся шарик» (⠋⠙⠹...) в последней строке лога. GUI-поток."""
-        self._spinner_on = True
-        self._spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        self._spin_i = 0
-        # берём текущую последнюю строку как старт-статус (обычно «Ready!»)
-        last = self.log_area.document().lastBlock().text()
-        self._spin_log = re.sub(r"<[^>]+>", "", last)
-        self.spin_timer = QTimer(self)
-        self.spin_timer.timeout.connect(self._spin_tick)
-        self.spin_timer.start(100)
-
-    def stop_spinner_final(self, text="Готово."):
-        """Отключает спиннер и оставляет итог в последней строке лога. GUI-поток."""
-        self._spinner_on = False
-        try:
-            self.spin_timer.stop()
-            self.spin_timer.deleteLater()
-        except Exception as e:
-            logging.error(f"[spinner] stop final: {e}")
-        self._sp_rewrite_last(text)
-
-    @pyqtSlot(object)
-    def _spinner_bridge(self, fn):
-        """Выполняет fn в GUI-потоке (вызывается через invokeMethod)."""
-        try:
-            fn()
-        except Exception as e:
-            logging.error(f"[spinner] bridge: {e}")
-
-    def _spin_tick(self):
-        if not getattr(self, "_spinner_on", False):
-            return
-        self._spin_i += 1
-        frame = self._spin_frames[self._spin_i % len(self._spin_frames)]
-        self._sp_rewrite_last(f"{frame} {self._spin_log}")
-
-    @pyqtSlot(str)
-    def _sp_rewrite_last(self, text):
-        """Переписывает последнюю строку QTextEdit (как \r в консоли). GUI-поток."""
-        try:
-            cur = self.log_area.textCursor()
-            doc = self.log_area.document()
-            block = doc.lastBlock()
-            b_from = block.position()
-            b_to = b_from + block.length() - 1
-            cur.setPosition(b_from)
-            cur.setPosition(b_to, cur.KeepAnchor)
-            cur.removeSelectedText()
-            cur.insertText(text)
-            self._trim_log()
-            self._ensure_bottom()
-        except Exception as e:
-            logging.error(f"[spinner] rewrite: {e}")
-
     def init_ui(self):
         self.setWindowTitle("Sakura Flow")
         self.setFixedSize(450, 800)
@@ -272,6 +383,7 @@ class NetworkToolsWindow(QWidget):
                 padding: 8px; border-radius: 4px; color: #e8e8f0;
             }
             QLineEdit:focus { border: 1px solid #ff7aa2; }
+            QLineEdit::placeholder { color: #9a9aae; }
             QPushButton { 
                 background-color: rgba(255, 122, 162, 0.12); 
                 border: 1px solid rgba(255, 122, 162, 0.35); 
@@ -303,14 +415,6 @@ class NetworkToolsWindow(QWidget):
         blocklist_row.addWidget(self.edit_ignore_btn)
         layout.addLayout(blocklist_row)
 
-        self.repair_btn = QPushButton("🔧 Fix && Troubleshoot")
-        self.repair_btn.setStyleSheet("""
-            QPushButton { background-color: rgba(108, 92, 231, 0.18); border: 1px solid rgba(108, 92, 231, 0.45); color: #b8b0e0; padding: 8px; border-radius: 4px; }
-            QPushButton:hover { background-color: rgba(108, 92, 231, 0.32); border: 1px solid #8b80ff; color: #ffffff; }
-            QPushButton:disabled { background-color: rgba(128, 128, 128, 0.15); border: 1px solid rgba(128,128,128,0.35); color: #777; }
-        """)
-        layout.addWidget(self.repair_btn)
-
         filter_row = QHBoxLayout()
         self.game_filter_btn = QPushButton(self._get_game_filter_label())
         self.game_filter_btn.setStyleSheet("""
@@ -330,15 +434,6 @@ class NetworkToolsWindow(QWidget):
 
         layout.addSpacing(4)
         layout.addWidget(QLabel("Network Utilities:"))
-        self.host_input = QLineEdit()
-        self.host_input.setPlaceholderText("google.com")
-        layout.addWidget(self.host_input)
-        net_btn_layout = QHBoxLayout()
-        self.ping_btn = QPushButton("Ping")
-        self.trace_btn = QPushButton("Trace")
-        net_btn_layout.addWidget(self.ping_btn)
-        net_btn_layout.addWidget(self.trace_btn)
-        layout.addLayout(net_btn_layout)
         self.clear_discord_btn = QPushButton("🧹 Clear Discord Cache")
         self.clear_discord_btn.setStyleSheet("""
             QPushButton { background-color: rgba(50, 90, 180, 0.25); border: 1px solid rgba(70, 130, 255, 0.5); color: #7aa2ff; font-weight: bold; padding: 8px; border-radius: 4px; }
@@ -367,16 +462,18 @@ class NetworkToolsWindow(QWidget):
         self.tg_secret_input.setPlaceholderText(tools.generate_secret())
         self.tg_secret_input.setText(tools.generate_secret())
         secret_layout.addWidget(self.tg_secret_input)
-        self.copy_secret_btn = QPushButton("Copy")
-        self.copy_secret_btn.setFixedWidth(60)
+        self.copy_secret_btn = QPushButton("Open in TG")
+        self.copy_secret_btn.setFixedWidth(110)
+        self.copy_secret_btn.setStyleSheet("""
+            QPushButton { background-color: rgba(42, 171, 228, 0.25); border: 1px solid #26a5e4; color: #7dd3f0; font-weight: bold; padding: 8px; border-radius: 4px; }
+            QPushButton:hover { background-color: rgba(110, 205, 255, 0.35); border: 1px solid #4fc3f0; }
+        """)
         secret_layout.addWidget(self.copy_secret_btn)
         layout.addLayout(secret_layout)
 
         self.mtproto_toggle_btn = QPushButton("START")
-        self.mtproto_toggle_btn.setStyleSheet("""
-            QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 8px; border-radius: 4px; }
-            QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
-        """)
+        self.mtproto_toggle_btn.setStyleSheet(self._MTPROTO_START_STYLE)
+        self._mtproto_busy = False
         layout.addWidget(self.mtproto_toggle_btn)
 
         layout.addSpacing(4)
@@ -439,39 +536,55 @@ class NetworkToolsWindow(QWidget):
 
         self.edit_list_btn.clicked.connect(self.open_list_editor)
         self.edit_ignore_btn.clicked.connect(self.open_ignore_editor)
-        self.repair_btn.clicked.connect(self.run_repair)
-        self.ping_btn.clicked.connect(self.run_ping_logic)
-        self.trace_btn.clicked.connect(lambda: tools.run_tracert(self.host_input.text()) if self.host_input.text() else None)
         self.test_dns_btn.clicked.connect(self.run_custom_dns_test)
         self.dns_best_btn.clicked.connect(self.run_best_dns_test)
         self.reset_dns_btn.clicked.connect(self.run_reset_dns)
         self.apply_dns_btn.clicked.connect(self.apply_best_dns)
         self.mtproto_toggle_btn.clicked.connect(self.toggle_mtproto_proxy)
-        self.copy_secret_btn.clicked.connect(self.copy_secret)
+        self.copy_secret_btn.clicked.connect(self.open_proxy_link)
         self.ipv6_toggle_btn.clicked.connect(self.toggle_ipv6)
         self.clear_discord_btn.clicked.connect(self.clear_discord_cache)
         self.game_filter_btn.clicked.connect(self.toggle_game_filter)
         self.ipset_btn.clicked.connect(self.toggle_ipset)
 
+        self.log_append(f"📄 Лог: {LOG_FILE}")
+
     def toggle_ipv6(self):
-        self._ipv6_on = not self._ipv6_on
-        state.save_state(ipv6_enabled=self._ipv6_on)
+        new_state = not self._ipv6_on
+        if new_state:
+            ok = tools.enable_ipv6()
+            self.log_append("IPv6 enabled")
+            for name in tools.get_ipv6_interface_names():
+                tools.set_ipv6_interface(name, True)
+        else:
+            ok = tools.disable_ipv6()
+            self.log_append("IPv6 disabled")
+            # реестра (DisabledComponents) мало: он действует только после
+            # перезагрузки, а интерфейсы продолжают работать, затем _sync_ipv6_btn
+            # считает это «самовключением». Отключаем интерфейсы netsh сразу —
+            # как это делает скрытая автонастройка.
+            for name in tools.get_ipv6_interface_names():
+                tools.set_ipv6_interface(name, False)
+        if not ok:
+            self.log_append("IPv6: не удалось изменить (нужны права администратора)", "red")
+            return
+        self._ipv6_on = new_state
+        state.save_state(ipv6_enabled=self._ipv6_on,
+                         ipv6_user_disabled=not self._ipv6_on)
+        self._ipv6_reapplied = False
+        self._ipv6_sync_warned = False
         if self._ipv6_on:
             self.ipv6_toggle_btn.setText("Turn OFF")
             self.ipv6_toggle_btn.setStyleSheet("""
                 QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
                 QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
             """)
-            tools.enable_ipv6()
-            self.log_append("IPv6 enabled")
         else:
             self.ipv6_toggle_btn.setText("Turn ON")
             self.ipv6_toggle_btn.setStyleSheet("""
                 QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
                 QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
             """)
-            tools.disable_ipv6()
-            self.log_append("IPv6 disabled")
         self.log_append("Restart required for changes to take effect")
 
     def _get_game_filter_label(self):
@@ -511,50 +624,45 @@ class NetworkToolsWindow(QWidget):
             self.log_append(f"[Discord] {result}")
         threading.Thread(target=_task, daemon=True).start()
 
-    def run_repair(self):
-        self.repair_btn.setEnabled(False)
-        self.log_append("\n" + "=" * 40)
-        self.log_append("🛠️  Diagnostics & Repair started...")
-        self.log_append("=" * 40)
-
-        def _ask(question):
-            from PyQt5.QtWidgets import QMessageBox
-            answer = [False]
-            done = threading.Event()
-
-            def _show():
-                ret = QMessageBox.question(
-                    self, "Sakura Flow", question,
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                answer[0] = (ret == QMessageBox.Yes)
-                done.set()
-
-            QMetaObject.invokeMethod(self, "_ask_from_thread",
-                                     Qt.QueuedConnection, Q_ARG(object, _show))
-            done.wait(15)
-            return answer[0]
-
+    def open_proxy_link(self):
+        # та же защита от повторного клика, что и у toggle
+        if getattr(self, "_mtproto_busy", False):
+            return
+        self._mtproto_busy = True
+        self.mtproto_toggle_btn.setEnabled(False)
+        host = self.tg_host_input.text().strip() or "127.0.0.1"
+        port = self.tg_port_input.text().strip() or "1443"
+        secret = self.tg_secret_input.text().strip() or tools.generate_secret()
+        link = f"tg://proxy?server={host}&port={port}&secret={secret}"
+        self.log_append("Starting MTPROTO proxy...")
         def _task():
             try:
-                QMetaObject.invokeMethod(self, "_spinner_bridge",
-                                         Qt.QueuedConnection,
-                                         Q_ARG(object, self.start_spinner))
-                repair.diagnose_and_repair(on_log=self.log_append, on_confirm=_ask)
+                if not tools.is_mtproto_proxy_running(port=int(port), host=host):
+                    ok = tools.start_mtproto_proxy(port=int(port), host=host, secret=secret)
+                    if not ok:
+                        self.log_append(f"Failed to start MTPROTO proxy on {host}:{port}", "red")
+                        return
+                state.save_state(mtproto_enabled=True, mtproto_port=port, mtproto_host=host, mtproto_secret=secret)
+                QMetaObject.invokeMethod(self, "_open_proxy_url",
+                                         Qt.QueuedConnection, Q_ARG(str, link))
+            except Exception as e:
+                self.log_append(f"ERROR: {e}", "red")
             finally:
-                QMetaObject.invokeMethod(self, "_spinner_bridge",
-                                         Qt.QueuedConnection,
-                                         Q_ARG(object, self.stop_spinner_final))
-                QMetaObject.invokeMethod(self.repair_btn, "setEnabled",
-                                         Qt.QueuedConnection, Q_ARG(bool, True))
-
+                QMetaObject.invokeMethod(self, "_finalize_mtproto",
+                                         Qt.QueuedConnection)
         threading.Thread(target=_task, daemon=True).start()
 
-    def copy_secret(self):
-        secret = self.tg_secret_input.text().strip()
-        QApplication.clipboard().setText(secret)
-        self.log_append("Secret copied to clipboard")
+    @pyqtSlot(str)
+    def _open_proxy_url(self, link):
+        if not QDesktopServices.openUrl(QUrl(link)):
+            self.log_append(f"Failed to open link: {link}", "red")
+        else:
+            self.log_append("Opening Telegram...")
 
     def toggle_mtproto_proxy(self):
+        # таймаут: пока вкл/выкл в процессе, повторные клики игнорируем
+        if getattr(self, "_mtproto_busy", False):
+            return
         try:
             port = int(self.tg_port_input.text().strip() or "1080")
         except ValueError:
@@ -562,16 +670,14 @@ class NetworkToolsWindow(QWidget):
             return
         host = self.tg_host_input.text().strip() or "127.0.0.1"
         secret = self.tg_secret_input.text().strip() or tools.generate_secret()
-        
-        self.log_append(f"[DEBUG] toggle_mtproto: {host}:{port}")
-        
+
+        # только disable (кнопка сереет через :disabled в стеке), без изменения
+        # текста/размера — иначе кнопка «прыгает» из-за смены padding
+        self._mtproto_busy = True
+        self.mtproto_toggle_btn.setEnabled(False)
+
         if self.mtproto_toggle_btn.text() == "STOP":
             self.log_append("Stopping MTPROTO proxy...")
-            self.mtproto_toggle_btn.setText("START")
-            self.mtproto_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
-            """)
             def do_stop():
                 try:
                     tools.stop_mtproto_proxy(port=port, host=host)
@@ -579,14 +685,12 @@ class NetworkToolsWindow(QWidget):
                     self.log_append("MTPROTO proxy stopped", "green")
                 except Exception as e:
                     self.log_append(f"ERROR: {e}", "red")
+                finally:
+                    QMetaObject.invokeMethod(self, "_finalize_mtproto",
+                                             Qt.QueuedConnection)
             threading.Thread(target=do_stop, daemon=True).start()
         else:
             self.log_append("Starting MTPROTO proxy...")
-            self.mtproto_toggle_btn.setText("STOP")
-            self.mtproto_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(255, 77, 136, 0.25); border: 1px solid #ff4d88; color: #ff7aa2; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(255, 122, 162, 0.35); border: 1px solid #ff7aa2; }
-            """)
             def do_start():
                 try:
                     ok = tools.start_mtproto_proxy(port=port, host=host, secret=secret)
@@ -602,30 +706,56 @@ class NetworkToolsWindow(QWidget):
                         self.log_append(f"Failed to start MTPROTO proxy on {host}:{port}", "red")
                 except Exception as e:
                     self.log_append(f"ERROR: {e}", "red")
+                finally:
+                    QMetaObject.invokeMethod(self, "_finalize_mtproto",
+                                             Qt.QueuedConnection)
             threading.Thread(target=do_start, daemon=True).start()
 
+    @pyqtSlot()
+    def _finalize_mtproto(self):
+        """Разблокирует кнопку прокси после вкл/выкл и возвращает ей текст по
+        фактическому состоянию (а не по тому, что надеялись сделать)."""
+        self._mtproto_busy = False
+        self.mtproto_toggle_btn.setEnabled(True)
+        try:
+            port = int(self.tg_port_input.text().strip() or "1080")
+            host = self.tg_host_input.text().strip() or "127.0.0.1"
+            running = tools.is_mtproto_proxy_running(port=port, host=host)
+        except Exception:
+            running = False
+        if running:
+            self.mtproto_toggle_btn.setText("STOP")
+            self.mtproto_toggle_btn.setStyleSheet(self._MTPROTO_STOP_STYLE)
+        else:
+            self.mtproto_toggle_btn.setText("START")
+            self.mtproto_toggle_btn.setStyleSheet(self._MTPROTO_START_STYLE)
+
     def open_list_editor(self):
-        self.list_editor = ListEditorWindow(self.restart_func, "general", self.start_menu, self.actions)
-        self.list_editor.show()
-        self.list_editor.activateWindow()
+        self._open_editor("general")
 
     def open_ignore_editor(self):
-        self.ignore_list_editor = ListEditorWindow(self.restart_func, "ignore", self.start_menu, self.actions)
-        self.ignore_list_editor.show()
-        self.ignore_list_editor.activateWindow()
+        self._open_editor("ignore")
+
+    def _open_editor(self, list_type):
+        attr = "list_editor" if list_type == "general" else "ignore_list_editor"
+        editor = getattr(self, attr, None)
+        if editor is None or not editor.isVisible():
+            editor = ListEditorWindow(self.restart_func, list_type, self.start_menu, self.actions)
+            setattr(self, attr, editor)
+            editor.show()
+            qr = editor.frameGeometry()
+            cp = QApplication.desktop().availableGeometry().center()
+            qr.moveCenter(cp)
+            editor.move(qr.topLeft())
+        editor.activateWindow()
+        editor.raise_()
 
     def closeEvent(self, event):
-        global tools_window
-        self.timer.stop()
-        if getattr(self, "spin_timer", None) is not None:
-            try:
-                self.spin_timer.stop()
-                self.spin_timer.deleteLater()
-            except Exception:
-                pass
+        # Окно НЕ уничтожается: close → hide (переиспользуется через tools_window).
+        # Статистику (update_stats/timer) НЕ гасим — иначе при повторном открытии
+        # счётчик трафика мёртв. Лог чистим (экономия RAM), как при hideEvent.
         self.log_area.clear()
-        tools_window = None
-        event.accept()
+        super().closeEvent(event)
 
     def hideEvent(self, event):
         """Окно прячется (в трей), но НЕ удаляется — объект NetworkToolsWindow
@@ -633,20 +763,10 @@ class NetworkToolsWindow(QWidget):
         clear() освобождает QTextDocument, чтобы память не «застревала» на +12 МБ
         при повторных открытиях меню без полного закрытия приложения."""
         try:
-            if getattr(self, "spin_timer", None) is not None:
-                self.spin_timer.stop()
             self.log_area.clear()
         except Exception:
             pass
         super().hideEvent(event)
-
-    @pyqtSlot(object)
-    def _ask_from_thread(self, show_fn):
-        """Runs on the GUI thread: executes the QMessageBox and signals back."""
-        try:
-            show_fn()
-        except Exception as e:
-            logging.error(f"[ask] {e}")
 
     def update_stats(self):
         up, down = tools.get_traffic_stats()
@@ -658,29 +778,32 @@ class NetworkToolsWindow(QWidget):
 
     def _sync_ipv6_btn(self):
         """Keep the IPv6 toggle in sync with the REAL system state (button must not lie)."""
-        real_enabled = repair.real_ipv6_enabled()
+        real_enabled = tools.real_ipv6_enabled()
         if real_enabled == self._ipv6_on:
+            self._ipv6_sync_warned = False
             return
-        self._ipv6_on = real_enabled
-        state.save_state(ipv6_enabled=real_enabled)
-        if real_enabled:
-            self.ipv6_toggle_btn.setText("Turn OFF")
-            self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
-            """)
-        else:
-            self.ipv6_toggle_btn.setText("Turn ON")
-            self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
-            """)
-        self.log_append(f"IPv6 реальное состояние обновлено: {'включен' if real_enabled else 'выключен'}", "green")
-
-    def run_ping_logic(self):
-        h = self.host_input.text().strip()
-        if h:
-            self.log_area.append(f"Ping {h}: {tools.get_ping(h)} ms")
+        # Пользователь явно выключал IPv6, но система снова его включила
+        # (Windows сбрасывает DisabledComponents после крупного обновления).
+        # Возвращаем отключку: один раз за запуск, чтобы не спамить в лог.
+        intent_disabled = bool(
+            state.load_state().get("ipv6_user_disabled", False))
+        if intent_disabled and real_enabled and not getattr(
+                self, "_ipv6_reapplied", False):
+            self._ipv6_reapplied = True
+            if tools.disable_ipv6():
+                for name in tools.get_ipv6_interface_names():
+                    tools.set_ipv6_interface(name, False)
+                self._ipv6_sync_warned = True
+                self.log_append(
+                    "IPv6: система снова включила IPv6 (сброс после обновления "
+                    "Windows) — отключаем заново")
+                return
+        # Расхождение: реестровая отключка IPv6 (DisabledComponents) применяется
+        # только после перезагрузки Windows, поэтому кнопку НЕ откатываем —
+        # она отражает выбранный режим. Просто уведомляем об этом один раз.
+        if not getattr(self, "_ipv6_sync_warned", False):
+            self._ipv6_sync_warned = True
+            self.log_append("IPv6: смена режима вступит в силу после перезагрузки Windows (кнопка показывает выбранный режим)")
 
     def run_custom_dns_test(self):
         dns = self.dns_input.text().strip()
@@ -713,6 +836,70 @@ class NetworkToolsWindow(QWidget):
 tools_window = None
 
 
+def _tag_top_windows():
+    """Проставляет каждому верхнеуровневому окну свой AppUserModelID через
+    SHGetPropertyStoreForWindow (PKEY_AppUserModel_ID). Без этого ПКМ-меню
+    панели задач берёт имя из exe и пишет «python» — даже при установленном
+    AppUserModelID процесса. С тегом меню показывает «Sakura Flow»."""
+    try:
+        from ctypes import (POINTER, Structure, Union, CFUNCTYPE, byref, cast,
+                            c_void_p, c_wchar_p, c_ulong, c_long, windll)
+        from ctypes import wintypes
+
+        class GUID(Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
+
+        class PROPERTYKEY(Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+        class _PV_UNION(Union):
+            _fields_ = [("pwszVal", c_wchar_p)]
+
+        class PROPVARIANT(Structure):
+            _anonymous_ = ("_u",)
+            _fields_ = [("vt", wintypes.WORD),
+                        ("wReserved1", wintypes.WORD),
+                        ("wReserved2", wintypes.WORD),
+                        ("wReserved3", wintypes.WORD),
+                        ("_u", _PV_UNION)]
+
+        IID_IPropertyStore = GUID(
+            0x886d8eeb, 0x8cf2, 0x4446,
+            (0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99))
+        PKEY_AppUserModel_ID = PROPERTYKEY(
+            GUID(0x9f4c2855, 0x9f79, 0x4b39,
+                 (0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0x03)), 5)
+
+        for w in QApplication.topLevelWidgets():
+            if not w.isWindow() or getattr(w, "_taskbar_tagged", False):
+                continue
+            hwnd = int(w.winId())
+            if not hwnd:
+                continue
+            ps = c_void_p()
+            hr = windll.shell32.SHGetPropertyStoreForWindow(
+                hwnd, byref(IID_IPropertyStore), byref(ps))
+            if hr != 0 or not ps.value:
+                continue
+            vtbl = None
+            try:
+                vtbl = cast(ps, POINTER(POINTER(c_void_p))).contents
+                pv = PROPVARIANT()
+                pv.vt = 31  # VT_LPWSTR
+                pv.pwszVal = _APP_ID
+                setvalue = cast(vtbl[6], CFUNCTYPE(
+                    c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT)))
+                setvalue(ps, byref(PKEY_AppUserModel_ID), byref(pv))
+                w._taskbar_tagged = True
+            finally:
+                if vtbl:
+                    release = cast(vtbl[2], CFUNCTYPE(c_ulong, c_void_p))
+                    release(ps)
+    except Exception as e:
+        logging.warning(f"[TASKBAR] tag windows: {e}")
+
+
 def open_tools(restart_func, start_menu=None, actions=None):
     global tools_window
     if tools_window is None:
@@ -722,25 +909,40 @@ def open_tools(restart_func, start_menu=None, actions=None):
 
 
 def update_menu_styles(start_menu, actions, active_version):
+    ph, check = _start_menu_icons()
     for bat, action in actions.items():
         if bat.stem == active_version:
             font = QFont()
             font.setBold(True)
             action.setFont(font)
-            if CHECK_ICON_PATH.exists():
-                action.setIcon(QIcon(str(CHECK_ICON_PATH)))
+            action.setIcon(check)
         else:
             action.setFont(QFont())
-            action.setIcon(QIcon())
+            action.setIcon(ph)
+
+
+class StickyMenu(QMenu):
+    """Tray menu that stays open when an item is clicked."""
+    def mouseReleaseEvent(self, event):
+        action = self.actionAt(event.pos())
+        if action is not None and not action.isSeparator():
+            action.activate(QAction.Trigger)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 def _show_first_run():
     from PyQt5.QtCore import Qt
-    msg = QMessageBox()
-    msg.setWindowTitle("Sakura Flow")
-    msg.setWindowIcon(QIcon(str(ICON_PATH)))
-    msg.setTextFormat(Qt.RichText)
-    msg.setText(
+    from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QLabel, QCheckBox,
+                                 QPushButton)
+
+    class _ReadBlock(QDialog):
+        """Диалог, который нельзя закрыть Esc/крестиком — только через «Принять»."""
+        def reject(self):
+            pass
+
+    first_run_html = (
         "<b>\U0001F338 Sakura Flow запущен</b><br><br>"
         "Приложение свернуто в <b>системный трей</b> \U0001F4CD<br>"
         "(область уведомлений рядом с часами).<br><br>"
@@ -749,37 +951,65 @@ def _show_first_run():
         "\u2462 Готово \u2705 YouTube, Discord, Rocket League \u2014 вс\u0451 работает.<br>"
         "&nbsp;&nbsp;&nbsp;<b>GameFilter:</b> TCP+UDP (рекомендуется) \u2699\uFE0F<br>"
         "&nbsp;&nbsp;&nbsp;<b>IPSet:</b> any (рекомендуется) \u2699\uFE0F<br>"
-        "&nbsp;&nbsp;&nbsp;Настройки в \U0001F6E0\uFE0F Network Tools \u2192 GameFilter / IPSet<br>"
-        "&nbsp;&nbsp;&nbsp;\u26A0\uFE0F После изменения GameFilter или IPSet — перезапусти обход (Stop \u2192 Start в трее)<br>"
-        "&nbsp;&nbsp;&nbsp;\u26A0\uFE0F Если обновлялись с предыдущей версии — выключи и включи <b>Autostart</b> в трей-меню, чтобы обновить путь в планировщике<br><br>"
+        "&nbsp;&nbsp;&nbsp;Настройки в \U0001F6E0\uFE0F Network Tools \u2192 GameFilter / IPSet<br><br>"
         "<b>Для Telegram:</b><br>"
         "\u2463 Открой \U0001F6E0\uFE0F Network Tools<br>"
-        "\u2464 Нажми <b>Copy</b> \U0001F4CB \u2014 секрет скопирован<br>"
-        "\u2465 В Telegram: Настройки \u2192 Продвинутые \u2192 Прокси \u2192 MTProto<br>"
-        "\u2466 Вставь данные:<br>"
-        "&nbsp;&nbsp;&nbsp;<b>Host:</b> 127.0.0.1<br>"
-        "&nbsp;&nbsp;&nbsp;<b>Port:</b> 1443<br>"
-        "&nbsp;&nbsp;&nbsp;<b>Secret:</b> (вставь скопированное)<br>"
-        "\u2467 Нажми <b>\u25B6\uFE0F START</b><br><br>"
-        "\u2757 <i>Это сообщение показывается только при первом запуске.</i>"
+        "\u2464 Нажми <b>Open in TG</b> \U0001F517 \u2014 прокси запустится сам и в Telegram откроется ссылка подключения<br>"
+        "\u2465 В Telegram подтверди <b>Connect</b> \u2714\uFE0F"
     )
-    msg.exec_()
+    dlg = _ReadBlock()
+    dlg.setWindowTitle("Sakura Flow")
+    dlg.setWindowIcon(QIcon(str(ICON_PATH)))
+    dlg.setModal(True)
+    dlg.setFixedWidth(480)
+    # без крестика и без закрытия по Esc — читать придётся
+    dlg.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+    lay = QVBoxLayout()
+    label = QLabel(first_run_html)
+    label.setTextFormat(Qt.RichText)
+    label.setWordWrap(True)
+    lay.addWidget(label)
+
+    check = QCheckBox("Я прочитал(а) и понял(а) инструкцию")
+    lay.addWidget(check)
+
+    btn_ok = QPushButton("Принять")
+    btn_ok.setEnabled(False)
+    btn_ok.setMinimumHeight(36)
+    lay.addWidget(btn_ok)
+    dlg.setLayout(lay)
+
+    def on_toggle():
+        btn_ok.setEnabled(check.isChecked())
+
+    check.toggled.connect(on_toggle)
+    btn_ok.clicked.connect(dlg.accept)
+
+    dlg.exec_()
     state.save_state(first_run=False)
 
 
 def create_tray_app(bat_files, register_sleep_handler=None):
+    logging.info("[TRAY] creating QApplication...")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(QIcon(str(ICON_PATH)))
+    pal = app.palette()
+    pal.setColor(QPalette.PlaceholderText, QColor("#9a9aae"))
+    app.setPalette(pal)
 
+    logging.info("[TRAY] creating tray icon...")
     tray = QSystemTrayIcon(QIcon(str(ICON_PATH)))
     tray.show()
+    logging.info("[TRAY] tray shown")
 
     app_state = state.load_state()
     if app_state.get("first_run", False):
+        logging.info("[TRAY] first run detected, scheduling welcome box")
         QTimer.singleShot(500, _show_first_run)
 
-    menu = QMenu()
+    logging.info("[TRAY] building menu...")
+    menu = StickyMenu()
     menu.setStyleSheet("""
         QMenu { background-color: #0f0a12; color: #ffffff; border: 1px solid #3d1b28; font-size: 14px; }
         QMenu::item { padding: 8px 32px 8px 12px; }
@@ -808,9 +1038,39 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                     threading.Thread(target=lambda b=b: service.start_service(b, b.stem), daemon=True).start()
                     break
 
+    # флаг занятости: пока вкл/выкл стратегии в процессе, повторные клики и
+    # sync-таймер кнопку НЕ трогают — иначе лейбл «мигает» (Start→Stop→Start).
+    # done сигналит, что рабочий поток закончил; _finish вызывается в GUI-потоке:
+    # воркер будит его через QMetaObject.invokeMethod(_bridge, "_run") (queued в
+    # event loop GUI-потока, thread-safe), sync-таймер — фолбэк, если иначе не дошло.
+    _bridge = _GuiBridge()
+    _strategy_busy = {"on": False, "done": False}
+
+    def _finish():
+        _strategy_busy["on"] = False
+        _strategy_busy["done"] = False
+        # состояние берём по факту после операции, а не по оптимистичному
+        # предположению (успешный start_service не обязан дать RUNNING сразу)
+        update_start_btn(start_btn, tools.is_winws_running())
+
     def toggle_strategy(btn):
-        """Toggle strategy on/off."""
-        if tools.is_winws_running():
+        """Toggle strategy on/off. All slow work (service start/stop) runs in
+        background threads so the UI never freezes; completion signals the GUI
+        thread via QMetaObject.invokeMethod(_bridge, "_run") — queued
+        cross-thread (pyqtSlot исполняется в event loop GUI-потока)."""
+        if _strategy_busy["on"]:
+            return
+        running = tools.is_winws_running()
+        _strategy_busy["on"] = True
+        _strategy_busy["done"] = False
+
+        def _notify_done():
+            _strategy_busy["done"] = True
+            QMetaObject.invokeMethod(_bridge, "_run",
+                                     Qt.QueuedConnection,
+                                     Q_ARG(object, _finish))
+
+        if running:
             def do_stop():
                 try:
                     service.stop_service()
@@ -818,36 +1078,42 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                     state.save_state(last_bat=None, stopped=True)
                 except Exception as e:
                     logging.error(f"[toggle_strategy] Stop error: {e}")
-                update_start_btn(btn, False)
+                finally:
+                    _notify_done()
             threading.Thread(target=do_stop, daemon=True).start()
         else:
-            app_state = state.load_state()
-            last_bat = app_state.get("last_bat")
-            if not last_bat:
-                last_bat = bat_files[0].stem if bat_files else "zapret-general"
-            bat_path = None
-            for b in bat_files:
-                if b.stem == last_bat:
-                    bat_path = b
-                    break
-            if not bat_path:
-                bat_path = bat_files[0]
-            state.save_state(last_bat=bat_path.stem, stopped=False)
-            threading.Thread(target=lambda: service.start_service(bat_path, bat_path.stem), daemon=True).start()
-            update_start_btn(btn, True)
+            def do_start():
+                try:
+                    app_state = state.load_state()
+                    last_bat = app_state.get("last_bat")
+                    bat_path = tools.pick_strategy_bat(bat_files, last_bat)
+                    if not bat_path:
+                        logging.error("[toggle_strategy] No strategy .bat found")
+                    else:
+                        state.save_state(last_bat=bat_path.stem, stopped=False)
+                        service.start_service(bat_path, bat_path.stem)
+                except Exception as e:
+                    logging.error(f"[toggle_strategy] Start error: {e}")
+                finally:
+                    _notify_done()
+            threading.Thread(target=do_start, daemon=True).start()
 
-    def update_start_btn(btn, running):
-        """Update Start button based on winws running state."""
-        if running:
-            btn.setText("  ⏹️ Stop")
-            if CHECK_ICON_PATH.exists():
-                btn.setIcon(QIcon(str(CHECK_ICON_PATH)))
-        else:
-            btn.setText("  ⚡ Start")
-            btn.setIcon(QIcon())
+    def update_start_btn(btn, running, force=False):
+        """Update Start button based on winws running state. Обновляется сразу,
+        даже когда меню открыто (свежее состояние видно без переоткрытия).
+        Защита от «мигания» Start→Stop→Start: при совпадении текста ничего не
+        трогаем — повторного setText не происходит. Иконка ВСЕГДА задаётся
+        фиксированного 16x16 размера (чек при запуске, прозрачная заглушка при
+        стопе), чтобы QMenu не схлопывал колонку иконок и текст не «прыгал»."""
+        new_text = "  ⏹️ Stop" if running else "  ⚡ Start"
+        if not force and btn.text() == new_text:
+            return
+        ph, check = _start_menu_icons()
+        btn.setIcon(check if running else ph)
+        btn.setText(new_text)
 
     start_btn = QAction("  ⚡ Start", menu)
-    update_start_btn(start_btn, tools.is_winws_running())
+    update_start_btn(start_btn, tools.is_winws_running(), force=True)
     start_btn.triggered.connect(lambda: toggle_strategy(start_btn))
     menu.addAction(start_btn)
     menu.addAction("  🌐 Internet Settings", lambda: subprocess.Popen("control ncpa.cpl", shell=True))
@@ -873,11 +1139,38 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     tray.activated.connect(lambda r: menu.popup(QCursor.pos()) if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
     tray.setContextMenu(menu)
 
+    # winws может кратко пропадать при перезапуске службы (после сна/редактирования
+    # списков/смены стратегии) — мгновенный флип кнопки выглядит как
+    # «сам вырубился». Меняем на Off только после 3 тиков подряд без процесса.
+    _absent_ticks = {"n": 0}
+
     def sync_start_btn():
-        update_start_btn(start_btn, tools.is_winws_running())
+        # рабочий поток завершился -> финализируем ТОЛЬКО тут, в GUI-потоке
+        if _strategy_busy["on"] and _strategy_busy["done"]:
+            _finish()
+        if _strategy_busy["on"]:
+            _absent_ticks["n"] = 0
+            return
+        running = tools.is_winws_running()
+        if running:
+            _absent_ticks["n"] = 0
+        else:
+            _absent_ticks["n"] += 1
+            if _absent_ticks["n"] < 3:
+                return
+        update_start_btn(start_btn, running)
+
+    # как только меню трея закрывается — сразу свежее состояние кнопки,
+    # а не через ждать следующий тик (1с)
+    menu.aboutToHide.connect(lambda: QTimer.singleShot(0, sync_start_btn))
 
     sync_timer = QTimer()
     sync_timer.timeout.connect(sync_start_btn)
     sync_timer.start(1000)
 
+    tag_timer = QTimer()
+    tag_timer.timeout.connect(_tag_top_windows)
+    tag_timer.start(2000)
+
+    logging.info("[TRAY] entering event loop")
     return app.exec_()

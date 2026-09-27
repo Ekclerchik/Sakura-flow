@@ -203,3 +203,5 @@ cython_debug/
 
 sakura_state.json
 RELEASE_TEMPLATE.txt
+data/
+*.bat.bak

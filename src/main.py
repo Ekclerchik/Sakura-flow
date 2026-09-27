@@ -51,6 +51,18 @@ except ImportError:
     except ImportError:
         tg_ws_proxy = None
 
+try:
+    import faulthandler
+    from pathlib import Path
+    import config as _cfg
+    Path(_cfg.CRASH_FILE).parent.mkdir(exist_ok=True)
+    fh = open(_cfg.CRASH_FILE, "a", encoding="utf-8", errors="replace")
+    faulthandler.enable(fh)
+    # exit=False: снимаем дамп заблокированного потока, но НЕ убиваем приложение.
+    faulthandler.dump_traceback_later(3600, exit=False)
+except Exception:
+    pass
+
 logging.basicConfig(
     filename=config.LOG_FILE,
     filemode="w",
@@ -140,7 +152,7 @@ def _main_inner():
 
     bat_files = [
         f for f in config.BAT_DIR.glob("*.bat") 
-        if f.name.lower() not in ["service.bat", "general.bat"]
+        if f.name.lower() not in ["service.bat", "general.bat", "_zapret_service.bat"]
     ]
 
     app_state = state.load_state()
@@ -148,9 +160,20 @@ def _main_inner():
         logging.info("[MTPROTO] Восстановление прокси после запуска")
         port = app_state.get("mtproto_port", 1443)
         host = app_state.get("mtproto_host", "127.0.0.1")
-        secret = app_state.get("mtproto_secret", "efac191ac9b83e4c0c8c4e5e7c6a6b6d")
+        secret = app_state.get("mtproto_secret")
+        # Пока старый процесс (после рестарта приложения) ещё держит порт прокси,
+        # первый старт может упасть с «Port already in use». Ретраим до 10 раз с
+        # паузой 1с: старый процесс умирает, порт освобождается, прокси поднимается.
         if not tools.start_mtproto_proxy(port=port, host=host, secret=secret):
-            logging.warning("[MTPROTO] Не удалось восстановить прокси")
+            logging.warning("[MTPROTO] Первая попытка восстановить прокси не удалась, ретраим...")
+            recovered = False
+            for attempt in range(10):
+                time.sleep(1)
+                if tools.start_mtproto_proxy(port=port, host=host, secret=secret):
+                    recovered = True
+                    break
+            if not recovered:
+                logging.error("[MTPROTO] Не удалось восстановить прокси после 10 попыток")
 
     last_bat = app_state.get("last_bat")
     if last_bat:
