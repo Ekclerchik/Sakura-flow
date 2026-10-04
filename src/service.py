@@ -1,8 +1,6 @@
 """Windows service management functions for Sakura Flow."""
-import os
 import subprocess
 import re
-import sys
 import time
 import logging
 from pathlib import Path
@@ -16,6 +14,17 @@ except ImportError:
 # sc.exe query выдаёт статус на языке ОС (RU: РАБОТАЕТ/ОСТАНОВЛЕН).
 _RUN_RE = re.compile(r"\b(RUNNING|РАБОТАЕТ)\b", re.IGNORECASE)
 _STOP_RE = re.compile(r"\b(STOPPED|ОСТАНОВЛЕН\w*)\b", re.IGNORECASE)
+
+# Запуск winws в стратегии .bat. Поддерживаются оба формата zapret:
+#   старый:  start "zapret: %~n0" /min "%BIN%winws.exe" --debug ...
+#   новый:   "%BIN%winws.exe" --debug ...            (Flowseal service.bat)
+_WINWS_RE = re.compile(r'"?[^"\s]*winws\.exe"?', re.IGNORECASE)
+# префикс `start "заголовок" /min` перед исполняемым файлом — выкидываем
+_START_PREFIX_RE = re.compile(r'^\s*start\s+(?:"[^"]*"|\S+)?\s*(?:/[a-z]+\s+)*$', re.IGNORECASE)
+# хвостовой редирект стратегии (`> "%LOG_FILE%" 2>&1`) — логирование делает
+# create_service (winws.log), лишний редирект ломал бы и его
+_TAIL_REDIRECT_RE = re.compile(
+    r'(?:\s*(?:>>?|&>)\s*(?:"[^"]*"|[^\s]+)\s*(?:2>&1|1>&2|&>\s*[^\s]+)?\s*)+$', re.IGNORECASE)
 
 
 def _wait_service_stopped(timeout=8):
@@ -34,6 +43,18 @@ def _wait_service_running(timeout=15):
     while time.time() - start < timeout:
         result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
         if result and (result.stdout and _RUN_RE.search(result.stdout)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _wait_service_gone(timeout=10):
+    """Служба удалена окончательно (sc query → 1060). Пока она в состоянии
+    'marked for deletion', sc create с тем же именем падает с 1072."""
+    start = time.time()
+    while time.time() - start < timeout:
+        result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
+        if result and result.returncode == 1060:
             return True
         time.sleep(0.5)
     return False
@@ -84,7 +105,34 @@ def get_service_display_name():
     return None
 
 
+def _extract_winws_command(bat_content):
+    """Первая строка батника с вызовом winws.exe + её продолжения (`^` в конце
+    строки) склеиваются в одну команду. Комментарии и пустые строки пропускаем."""
+    command = None
+    for raw_line in bat_content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("::") or line.lower().startswith("rem "):
+            continue
+        continued = line.endswith("^")
+        if continued:
+            line = line[:-1].strip()
+            if not line:
+                continue
+        if command is None:
+            if not _WINWS_RE.search(line):
+                continue
+            command = line
+            if not continued:
+                break
+            continue
+        command = f"{command} {line}"
+        if not continued:
+            break
+    return command
+
+
 def parse_bat_file(batch_path):
+    """Достаёт из стратегии .bat путь к winws.exe и его аргументы."""
     logging.info(f"Разбор стратегии: {batch_path}")
     with open(batch_path, 'r', encoding="utf-8") as f:
         bat_content = f.read()
@@ -118,12 +166,18 @@ def parse_bat_file(batch_path):
     bat_content = bat_content.replace("%GameFilterTCP%", game_filter_tcp)
     bat_content = bat_content.replace("%GameFilterUDP%", game_filter_udp)
 
-    start_match = re.search(r'start\s+"[^"]*"\s+/min\s+"?[^"\s]+"?\s+(.+)', bat_content, re.DOTALL)
-    if not start_match:
-        sys.exit("Ошибка: winws.exe не найден в батнике")
+    command = _extract_winws_command(bat_content)
+    if not command:
+        raise ValueError(f"Ошибка: вызов winws.exe не найден в батнике {batch_path}")
+
+    exe_match = _WINWS_RE.search(command)
+    prefix = _START_PREFIX_RE.sub("", command[:exe_match.start()])
+    args = (prefix + command[exe_match.end():]).strip()
+    args = _TAIL_REDIRECT_RE.sub("", args).strip()
 
     executable = str(bin_dir / "winws.exe")
-    args = start_match.group(1).strip().replace('^', '').replace('\n', ' ').strip()
+    if not Path(executable).exists():
+        raise FileNotFoundError(f"Ошибка: {executable} не найден")
 
     replacements = {
         "%BIN%": str(bin_dir) + "\\",
@@ -154,13 +208,21 @@ def create_service(batch_path, display_version):
         'sc.exe', 'create', SERVICE_NAME, 'start=', 'auto',
         'displayname=', service_display, 'binPath=', cmd_line
     ]
-    subprocess.run(cmd_args, capture_output=True, text=True, encoding=CONSOLE_ENCODING)
+    result = subprocess.run(cmd_args, capture_output=True, text=True, encoding=CONSOLE_ENCODING)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"sc.exe create не удался ({result.returncode}): "
+            f"{(result.stderr or result.stdout or '').strip()}")
 
 
 def start_service(batch_path, display_version):
     if service_exists():
         stop_service()
+        # без этих ожиданий sc create иногда падает с 1072/183: служба ещё
+        # не остановилась или висит в 'marked for deletion' после sc delete
+        _wait_service_stopped()
         delete_service()
+        _wait_service_gone()
 
     # если драйвер завис в STOP_PENDING — winws не стартует до перезагрузки ПК;
     # честно сообщаем, а не молча создаём мёртвую службу
@@ -168,7 +230,13 @@ def start_service(batch_path, display_version):
         logging.error("[SERVICE] WinDivert завис в STOP_PENDING — winws не запустится до перезагрузки ПК")
         return False
 
-    create_service(batch_path, display_version)
+    try:
+        create_service(batch_path, display_version)
+    except Exception as e:
+        # sys.exit здесь убивал поток GUI/старта — обычное исключение ловится
+        # вызывающим кодом и пишется в лог
+        logging.error(f"[SERVICE] Не удалось создать службу: {e}")
+        return False
     run_cmd(f'sc.exe start "{SERVICE_NAME}"')
     ok = _wait_service_running()
     if not ok:
