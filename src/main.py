@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 try:
-    import win32api
     import win32con
     import win32gui
     HAS_WIN32 = True
@@ -71,18 +70,25 @@ logging.basicConfig(
     encoding='utf-8'
 )
 
+# Dev-запуск (например, из VSCode): дублируем лог в консоль, чтобы ошибки
+# («winws не запустился …», список причин) были видны сразу, без чтения файла.
+# В собранном exe консоли нет (sys.stdout = None) — там ничего не добавляем.
+if not getattr(sys, "frozen", False) and sys.stdout is not None:
+    _console = logging.StreamHandler()
+    _console.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+    _console.setLevel(os.environ.get("SAKURA_CONSOLE_LEVEL", "INFO"))
+    logging.getLogger().addHandler(_console)
+
 _current_bat = None
 _restart_func = None
 
 def on_wake():
-    global _current_bat, _restart_func
     logging.info("Компьютер проснулся! Проверяю службу...")
     
     if _current_bat and _restart_func:
         time.sleep(2)
         try:
             service.stop_service()
-            service.delete_service()
             _restart_func()
             logging.info("Служба перезапущена после пробуждения")
         except Exception as e:
@@ -123,7 +129,7 @@ def register_sleep_handler(restart_func, current_bat):
         wc.lpfnWndProc = WndProc
         wc.lpszClassName = "SakuraFlowPower"
         win32gui.RegisterClass(wc)
-        hwnd = win32gui.CreateWindow("SakuraFlowPower", "SakuraFlow", 0, 0, 0, 0, 0, 0, 0, 0, None)
+        win32gui.CreateWindow("SakuraFlowPower", "SakuraFlow", 0, 0, 0, 0, 0, 0, 0, 0, None)
         
         logging.info("Обработчик сна зарегистрирован")
     except Exception as e:
@@ -141,6 +147,10 @@ def main():
 def _main_inner():
     logging.info(f"START SAKURA FLOW. CWD: {os.getcwd()}")
     
+    # Паритет 3.3.9: приложение требует прав администратора (служба, winws,
+    # отключение IPv6, задача автозапуска с RunLevel=Highest). Без этого блока
+    # запуск «как есть» не может ни пересоздать службу, ни создать автозапуск
+    # (RegisterTaskDefinition → Access denied), поэтому автозапуск «всегда выкл».
     if not admin.is_admin():
         logging.info("Запрос прав администратора...")
         admin.run_as_admin()
@@ -161,19 +171,25 @@ def _main_inner():
         port = app_state.get("mtproto_port", 1443)
         host = app_state.get("mtproto_host", "127.0.0.1")
         secret = app_state.get("mtproto_secret")
-        # Пока старый процесс (после рестарта приложения) ещё держит порт прокси,
-        # первый старт может упасть с «Port already in use». Ретраим до 10 раз с
-        # паузой 1с: старый процесс умирает, порт освобождается, прокси поднимается.
-        if not tools.start_mtproto_proxy(port=port, host=host, secret=secret):
+
+        def _restore_mtproto():
+            # Пока старый процесс (после рестарта приложения) ещё держит порт
+            # прокси, первый старт может упасть с «Port already in use». Ретраим
+            # до 10 раз с паузой 1с: старый процесс умирает, порт освобождается,
+            # прокси поднимается. ВАЖНО: всё это в ФОНОВОМ потоке — иначе создание
+            # трея блокируется до ~10с и при рестарте выглядит как «очень долго
+            # грузит». Раньше цикл был синхронным здесь, до create_tray_app.
+            if tools.start_mtproto_proxy(port=port, host=host, secret=secret):
+                return
             logging.warning("[MTPROTO] Первая попытка восстановить прокси не удалась, ретраим...")
-            recovered = False
-            for attempt in range(10):
+            for _ in range(10):
                 time.sleep(1)
                 if tools.start_mtproto_proxy(port=port, host=host, secret=secret):
-                    recovered = True
-                    break
-            if not recovered:
-                logging.error("[MTPROTO] Не удалось восстановить прокси после 10 попыток")
+                    logging.info("[MTPROTO] Прокси восстановлен повторной попыткой")
+                    return
+            logging.error("[MTPROTO] Не удалось восстановить прокси после 10 попыток")
+
+        threading.Thread(target=_restore_mtproto, daemon=True).start()
 
     last_bat = app_state.get("last_bat")
     if last_bat:
@@ -188,7 +204,7 @@ def _main_inner():
     app_state = state.load_state()
     port = app_state.get("mtproto_port", 1443)
     host = app_state.get("mtproto_host", "127.0.0.1")
-    tools.stop_mtproto_proxy(port=port, host=host)
+    tools.stop_mtproto_proxy(port=port, host=host, wait=False)
     
     sys.exit(exit_code)
 

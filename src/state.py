@@ -20,12 +20,14 @@ DEFAULT_STATE = {
     "stopped": True,
     "first_run": True,
     "ipv6_enabled": True,
+    "ipv6_user_disabled": False,
     "mtproto_enabled": False,
     "mtproto_port": 1443,
     "mtproto_host": "127.0.0.1",
     "mtproto_secret": None,
     "game_filter_mode": None,
-    "ipset_mode": None
+    "ipset_mode": None,
+    "custom_dc_redirects": {}
 }
 
 _lock = threading.Lock()
@@ -36,18 +38,27 @@ def _validate_secret(s):
 
 
 def _build_state(source):
-    return {
+    # ВАЖНО: сохраняем и НЕизвестные ключи (dict(source)), а не только
+    # перечисленные ниже. Раньше жёсткий whitelist молча выбрасывал
+    # ipv6_user_disabled / custom_dc_redirects
+    # при каждом save_state — из-за этого, например, не работало авто-повторное
+    # отключение IPv6 после сброса настроек Windows.
+    data = dict(source) if isinstance(source, dict) else {}
+    data.update({
         "last_bat": source.get("last_bat"),
         "stopped": source.get("stopped", True),
         "first_run": source.get("first_run", False),
         "ipv6_enabled": source.get("ipv6_enabled", True),
+        "ipv6_user_disabled": source.get("ipv6_user_disabled", False),
         "mtproto_enabled": source.get("mtproto_enabled", False),
         "mtproto_port": source.get("mtproto_port", 1443),
         "mtproto_host": source.get("mtproto_host", "127.0.0.1"),
         "mtproto_secret": _validate_secret(source.get("mtproto_secret")),
         "game_filter_mode": source.get("game_filter_mode"),
-        "ipset_mode": source.get("ipset_mode")
-    }
+        "ipset_mode": source.get("ipset_mode"),
+        "custom_dc_redirects": source.get("custom_dc_redirects", {})
+    })
+    return data
 
 
 def get_default_state():

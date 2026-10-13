@@ -7,8 +7,8 @@ import ctypes
 import logging
 
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QMessageBox, QShortcut)
-from PyQt5.QtGui import QDesktopServices, QIcon, QFont, QCursor, QPixmap, QKeySequence, QPalette, QColor
-from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot, QObject
+from PyQt5.QtGui import QDesktopServices, QIcon, QCursor, QPixmap, QKeySequence, QPalette, QColor
+from PyQt5.QtCore import QUrl, Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot, QObject, QPoint
 
 try:
     myappid = 'ekcler.sakuraflow.v1.2'
@@ -17,13 +17,13 @@ except Exception:
     pass
 
 try:
-    from .config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR, LOG_FILE
+    from .config import ICON_PATH, CHECK_ICON_PATH, LOG_FILE
     from . import service, autostart, state, tools
 except ImportError:
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from src.config import ICON_PATH, CHECK_ICON_PATH, BASE_DIR, LOG_FILE
+    from src.config import ICON_PATH, CHECK_ICON_PATH, LOG_FILE
     from src import service, autostart, state, tools
 
 
@@ -75,12 +75,10 @@ class ListEditorWindow(QWidget):
     несохранённых изменениях, счётчики доменов/строк, sort&dedupe,
     валидация строк и Ctrl+S."""
 
-    def __init__(self, restart_func, list_type="general", start_menu=None, actions=None):
+    def __init__(self, restart_func, list_type="general"):
         super().__init__()
         self.restart_func = restart_func
         self.list_type = list_type
-        self.start_menu = start_menu
-        self.actions = actions
         self._original = ""
         self._dirty = False
         self.init_ui()
@@ -246,13 +244,24 @@ class ListEditorWindow(QWidget):
 
         self._dirty = False
         self._update_title()
-        service.stop_service()
-        service.delete_service()
-        if self.start_menu and self.actions:
-            update_menu_styles(self.start_menu, self.actions, None)
+
+        def _restart_task():
+            try:
+                # stop_service теперь сама удаляет службу и ждёт полного стопа
+                service.stop_service()
+                if self.restart_func:
+                    self.restart_func()
+            except Exception as e:
+                logging.error(f"[list] restart after save: {e}")
+
         if self.restart_func:
-            self.restart_func()
-        QMessageBox.information(self, "Success", "List updated! Service restarted.")
+            threading.Thread(target=_restart_task, daemon=True).start()
+            QMessageBox.information(self, "Success",
+                                    "List updated! Service restarted.")
+        else:
+            service.stop_service()
+            QMessageBox.information(self, "Success",
+                                    "List updated! Service stopped.")
         self.close()
 
     def closeEvent(self, event):
@@ -280,12 +289,12 @@ class ListEditorWindow(QWidget):
 
 
 class NetworkToolsWindow(QWidget):
-    def __init__(self, restart_func, start_menu=None, actions=None):
+    def __init__(self, restart_func):
         super().__init__()
         self.restart_func = restart_func
-        self.start_menu = start_menu
-        self.actions = actions
         self.best_dns_found = None
+        self._bridge = _GuiBridge()
+        self._dns_busy = False
         self.list_editor = None
         self.ignore_list_editor = None
         self._tg_proxy_on = False
@@ -664,7 +673,7 @@ class NetworkToolsWindow(QWidget):
         if getattr(self, "_mtproto_busy", False):
             return
         try:
-            port = int(self.tg_port_input.text().strip() or "1080")
+            port = int(self.tg_port_input.text().strip() or "1443")
         except ValueError:
             self.log_append(f"Invalid port: {self.tg_port_input.text().strip()}", "red")
             return
@@ -718,7 +727,7 @@ class NetworkToolsWindow(QWidget):
         self._mtproto_busy = False
         self.mtproto_toggle_btn.setEnabled(True)
         try:
-            port = int(self.tg_port_input.text().strip() or "1080")
+            port = int(self.tg_port_input.text().strip() or "1443")
             host = self.tg_host_input.text().strip() or "127.0.0.1"
             running = tools.is_mtproto_proxy_running(port=port, host=host)
         except Exception:
@@ -740,7 +749,7 @@ class NetworkToolsWindow(QWidget):
         attr = "list_editor" if list_type == "general" else "ignore_list_editor"
         editor = getattr(self, attr, None)
         if editor is None or not editor.isVisible():
-            editor = ListEditorWindow(self.restart_func, list_type, self.start_menu, self.actions)
+            editor = ListEditorWindow(self.restart_func, list_type)
             setattr(self, attr, editor)
             editor.show()
             qr = editor.frameGeometry()
@@ -766,13 +775,46 @@ class NetworkToolsWindow(QWidget):
             self.log_area.clear()
         except Exception:
             pass
+        # Запоминаем позицию окна: восстановим при следующем открытии и между
+        # запусками (state.json). Пишем на hide, а не на move — иначе state
+        # сохранялся бы десятки раз за время перетаскивания.
+        try:
+            state.save_state(tools_win_x=self.x(), tools_win_y=self.y())
+        except Exception:
+            pass
         super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Вернуть окно туда, где его оставили (позиция сохранена в hideEvent).
+        # Восстанавливаем только если точка реально попадает на существующий
+        # монитор — иначе после отключения второго экрана окно уехало бы за
+        # пределы видимой области.
+        try:
+            st = state.load_state()
+            wx, wy = st.get("tools_win_x"), st.get("tools_win_y")
+            if isinstance(wx, int) and isinstance(wy, int):
+                for scr in QApplication.screens():
+                    if scr.availableGeometry().contains(QPoint(wx, wy)):
+                        self.move(wx, wy)
+                        break
+        except Exception as e:
+            logging.warning(f"[tools] restore window pos: {e}")
+        # Окно открыли — сразу приводим кнопку IPv6 к реальному состоянию:
+        # пока окно было скрыто, _sync_ipv6_btn не вызывался (см. update_stats).
+        self._ipv6_check_accum = 0
+        self._sync_ipv6_btn()
 
     def update_stats(self):
         up, down = tools.get_traffic_stats()
         self.traffic_label.setText(f"TRAFFIC | UP: {up} KB/s | DOWN: {down} KB/s")
+        # netsh-проверка IPv6 — тяжёлый subprocess; в скрытом окне она не нужна
+        # (кнопки не видно). Трафик считаем всегда: он дешёвый (~2мс) и держит
+        # непрерывность счётчика между открытиями (см. пояснение в closeEvent).
+        if not self.isVisible():
+            return
         self._ipv6_check_accum = getattr(self, "_ipv6_check_accum", 0) + 1
-        if self._ipv6_check_accum >= 5:
+        if self._ipv6_check_accum >= 30:
             self._ipv6_check_accum = 0
             self._sync_ipv6_btn()
 
@@ -807,20 +849,51 @@ class NetworkToolsWindow(QWidget):
 
     def run_custom_dns_test(self):
         dns = self.dns_input.text().strip()
-        if dns:
+        if not dns:
+            return
+        self.test_dns_btn.setEnabled(False)
+        self.log_area.append(f"Pinging {dns}...")
+
+        def _work():
             res = tools.get_ping(dns)
-            self.log_area.append(f"DNS {dns}: {res} ms")
-            if isinstance(res, (float, int)):
-                self.best_dns_found = dns
-                self.apply_dns_btn.show()
+
+            def _apply():
+                self.log_area.append(f"DNS {dns}: {res} ms")
+                if isinstance(res, (float, int)):
+                    self.best_dns_found = dns
+                    self.apply_dns_btn.show()
+                self.test_dns_btn.setEnabled(True)
+
+            QMetaObject.invokeMethod(self._bridge, "_run",
+                                     Qt.QueuedConnection, Q_ARG(object, _apply))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def run_best_dns_test(self):
+        # find_best_dns делает nslookup×8 + пинги с таймаутами — в UI-потоке это
+        # морозило окно, поэтому уводим в фон, а результат возвращаем в GUI-поток
+        # через мост (QueuedConnection), как это делают Start/Stop и MTProto.
+        if self._dns_busy:
+            return
+        self._dns_busy = True
+        self.dns_best_btn.setEnabled(False)
         self.log_area.append("Scanning DNS...")
-        ip, info = tools.find_best_dns()
-        self.log_area.append(f"Best: {info}")
-        if ip:
-            self.best_dns_found = ip
-            self.apply_dns_btn.show()
+
+        def _work():
+            ips, info = tools.find_best_dns()
+
+            def _apply():
+                self.log_area.append(f"Best: {info}")
+                if ips:
+                    self.best_dns_found = ips
+                    self.apply_dns_btn.show()
+                self.dns_best_btn.setEnabled(True)
+                self._dns_busy = False
+
+            QMetaObject.invokeMethod(self._bridge, "_run",
+                                     Qt.QueuedConnection, Q_ARG(object, _apply))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def apply_best_dns(self):
         if self.best_dns_found:
@@ -900,25 +973,12 @@ def _tag_top_windows():
         logging.warning(f"[TASKBAR] tag windows: {e}")
 
 
-def open_tools(restart_func, start_menu=None, actions=None):
+def open_tools(restart_func):
     global tools_window
     if tools_window is None:
-        tools_window = NetworkToolsWindow(restart_func, start_menu, actions)
+        tools_window = NetworkToolsWindow(restart_func)
     tools_window.show()
     tools_window.activateWindow()
-
-
-def update_menu_styles(start_menu, actions, active_version):
-    ph, check = _start_menu_icons()
-    for bat, action in actions.items():
-        if bat.stem == active_version:
-            font = QFont()
-            font.setBold(True)
-            action.setFont(font)
-            action.setIcon(check)
-        else:
-            action.setFont(QFont())
-            action.setIcon(ph)
 
 
 class StickyMenu(QMenu):
@@ -1053,11 +1113,29 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         # предположению (успешный start_service не обязан дать RUNNING сразу)
         update_start_btn(start_btn, tools.is_winws_running())
 
+    def _notify_start_failure():
+        """Показать пользователю причину, почему winws не поднялся (а не только
+        писать в файловый лог)."""
+        try:
+            detail = service.describe_start_failure()
+        except Exception as e:
+            detail = f"Не удалось собрать диагностику: {e}"
+        logging.error(f"[toggle_strategy] winws не запустился:\n{detail}")
+        try:
+            tray.showMessage("Sakura Flow — winws не запустился", detail,
+                             QSystemTrayIcon.Warning, 12000)
+        except Exception:
+            pass
+
     def toggle_strategy(btn):
         """Toggle strategy on/off. All slow work (service start/stop) runs in
         background threads so the UI never freezes; completion signals the GUI
         thread via QMetaObject.invokeMethod(_bridge, "_run") — queued
-        cross-thread (pyqtSlot исполняется в event loop GUI-потока)."""
+        cross-thread (pyqtSlot исполняется в event loop GUI-потока).
+
+        start/stop теперь БЫСТРЫЕ (см. ИНВАРИАНТ 4 в service.py). Не добавлять в
+        do_start/do_stop длинные ожидания: пока идёт стоп, кнопка «залипает»
+        (была жалоба «стоп не нажимается»)."""
         if _strategy_busy["on"]:
             return
         running = tools.is_winws_running()
@@ -1073,8 +1151,8 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         if running:
             def do_stop():
                 try:
+                    # stop_service теперь сама удаляет службу и ждёт полного стопа
                     service.stop_service()
-                    service.delete_service()
                     state.save_state(last_bat=None, stopped=True)
                 except Exception as e:
                     logging.error(f"[toggle_strategy] Stop error: {e}")
@@ -1089,11 +1167,14 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                     bat_path = tools.pick_strategy_bat(bat_files, last_bat)
                     if not bat_path:
                         logging.error("[toggle_strategy] No strategy .bat found")
+                        _notify_start_failure()
                     else:
                         state.save_state(last_bat=bat_path.stem, stopped=False)
-                        service.start_service(bat_path, bat_path.stem)
+                        if not service.start_service(bat_path, bat_path.stem):
+                            _notify_start_failure()
                 except Exception as e:
                     logging.error(f"[toggle_strategy] Start error: {e}")
+                    _notify_start_failure()
                 finally:
                     _notify_done()
             threading.Thread(target=do_start, daemon=True).start()
@@ -1116,8 +1197,8 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     update_start_btn(start_btn, tools.is_winws_running(), force=True)
     start_btn.triggered.connect(lambda: toggle_strategy(start_btn))
     menu.addAction(start_btn)
-    menu.addAction("  🌐 Internet Settings", lambda: subprocess.Popen("control ncpa.cpl", shell=True))
-    menu.addAction("  🛠️ Network Tools", lambda: open_tools(quick_restart, None, {}))
+    menu.addAction("  🌐 Internet Settings", lambda: subprocess.Popen("control ncpa.cpl", shell=True, creationflags=0x08000000))
+    menu.addAction("  🛠️ Network Tools", lambda: open_tools(quick_restart))
     menu.addSeparator()
 
     autostart_action = menu.addAction("  🔄 Autostart")
@@ -1127,14 +1208,74 @@ def create_tray_app(bat_files, register_sleep_handler=None):
 
     menu.addSeparator()
 
+    def _hide_all_windows():
+        # Приложение живёт в трее, поэтому единственное видимое top-level окно —
+        # это Network Tools (или редактор списка). QApplication.quit() НЕ закрывает
+        # окна: если на момент выхода видимое окно осталось, Windows оставляет
+        # «мёртвую» иконку приложения на панели задач (её видно, пока не пройдёшь
+        # по ней курсором). Прячем все окна ДО синхронной остановки службы:
+        # hide() не блокирует и НЕ дёргает closeEvent (где может выскочить
+        # диалог «Save changes?» — он бы заморозил выход).
+        try:
+            for w in QApplication.topLevelWidgets():
+                w.hide()
+        except Exception:
+            pass
+
     def app_restart():
-        subprocess.Popen([sys.executable] + sys.argv)
-        service.stop_service()
+        # Механика как в эталонной 3.3.9: сначала поднимаем новый экземпляр,
+        # потом синхронно гасим службу и выходим. Остановка быстрая (sc stop →
+        # taskkill winws), поэтому трей и меню исчезают сразу.
+        # Не уводить service.stop_service() в фоновый поток (ИНВАРИАНТ 6).
+        # Прячем popup-меню до синхронной остановки (см. app_exit).
+        try:
+            menu.hide()
+        except Exception:
+            pass
+        try:
+            tray.hide()
+        except Exception:
+            pass
+        _hide_all_windows()
+        try:
+            subprocess.Popen([sys.executable] + sys.argv, creationflags=0x08000000)
+        except Exception as e:
+            logging.error(f"[app] restart spawn error: {e}")
+        try:
+            service.stop_service()
+        except Exception as e:
+            logging.error(f"[app] restart stop error: {e}")
+        QApplication.quit()
+
+    def app_exit():
+        # Выход гасит всё синхронно (как в эталонной 3.3.9): служба + winws, затем
+        # выход. Без фоновых потоков и моста — меню и иконка исчезают сразу.
+        # service.stop_service() НЕ уводить в фоновый поток и не добавлять
+        # ожиданий — иначе трей/меню зависают (ИНВАРИАНТ 6 в service.py).
+        # ВАЖНО: сначала прячем popup-меню. StickyMenu намеренно НЕ закрывается
+        # после клика (чтобы меню жило для Start/Stop), а stop_service()
+        # синхронно морозит GUI-поток — без этого окно меню остаётся на экране
+        # замороженным и «висит» до смерти процесса.
+        try:
+            menu.hide()
+        except Exception:
+            pass
+        try:
+            tray.hide()
+        except Exception:
+            pass
+        # и прячем все окна (Network Tools / редакторы): иначе их кнопка на панели
+        # задач остаётся «мёртвой» иконкой после выхода (см. _hide_all_windows).
+        _hide_all_windows()
+        try:
+            service.stop_service()
+        except Exception as e:
+            logging.error(f"[app] exit stop error: {e}")
         QApplication.quit()
 
     menu.addAction("  🔁 Restart", app_restart)
     menu.addSeparator()
-    menu.addAction("  🚪 Exit", lambda: (service.stop_service(), QApplication.quit()))
+    menu.addAction("  🚪 Exit", app_exit)
 
     tray.activated.connect(lambda r: menu.popup(QCursor.pos()) if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
     tray.setContextMenu(menu)

@@ -1,6 +1,5 @@
 """Configuration constants for Sakura Flow application."""
 import sys
-import os
 from pathlib import Path
 
 # Названия

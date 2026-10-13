@@ -21,7 +21,7 @@ VSVersionInfo(
         StringStruct(u'LegalCopyright', u'\xa9 Ekcler. All rights reserved.'),
         StringStruct(u'OriginalFilename', u'SakuraFlow.exe'),
         StringStruct(u'ProductName', u'Sakura Flow'),
-        StringStruct(u'ProductVersion', u'3.3.4')])
+        StringStruct(u'ProductVersion', u'3.4.0')])
       ]), 
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
   ]
