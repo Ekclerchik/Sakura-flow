@@ -58,3 +58,15 @@ steam.apac.qtlglb.com.mwcloudcdn.com
 cdn.mileweb.cs.steampowered.com.8686c.com
 steampowered.com.8686c.com
 steamstatic.com.8686c.com
+steamcommunity.com
+steamcommunity-a.akamaihd.net
+steam-chat.com
+steampowered.com
+steamserver.net
+steamcontent.com
+steamstatic.com
+steamusercontent.com
+steamgames.com
+steam-api.com
+api.steampowered.com
+s.team

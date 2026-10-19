@@ -29,9 +29,9 @@ def enable_autostart():
         trigger.Id = 'LogonTrigger'
         trigger.StartBoundary = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         
-        # Настраиваем действие для запуска Moonstone.exe
+        # Настраиваем действие для запуска SakuraFlow.exe
         action = task_def.Actions.Create(0)  # 0 = TASK_ACTION_EXEC
-        action.ID = 'MoonstoneStart'
+        action.ID = 'SakuraFlowStart'
         action.Path = str(Path(sys.executable).resolve())
         
         # Настраиваем параметры задачи

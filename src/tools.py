@@ -20,6 +20,11 @@ except ImportError:
     ping = None
 
 try:
+    import winreg  # только Windows: читаем реестр без запуска процесса
+except ImportError:
+    winreg = None
+
+try:
     from .config import BASE_DIR, FILE_ENCODING
     from . import state
     from .state import generate_secret
@@ -91,7 +96,7 @@ def get_traffic_stats():
         down = (now_io[1] - _last_io[1]) / 1024
         _last_io = now_io
         return max(0, round(up, 1)), max(0, round(down, 1))
-    except:
+    except Exception:
         return 0.0, 0.0
 
 
@@ -592,22 +597,27 @@ def real_ipv6_enabled():
 
 def _is_ipv6_enabled_actual():
     """Реальная проверка: IPv6 считается включенным, если есть хотя бы один
-    активный IPv6-интерфейс, кроме loopback. Статус netsh локален:
-    EN: connected/up, RU: Подключено/Активн — парсим оба варианта."""
+    активный (up) не-loopback интерфейс с IPv6-адресом, кроме ::1.
+
+    Раньше здесь запускался subprocess `netsh interface ipv6 show interfaces`:
+    это новый процесс в ОС (~30-60 мс) на каждый вызов, а вызывается он из
+    GUI-потока (ui.update_stats, таймер 1 с) — отсюда микрофризы. psutil
+    читает то же состояние через API, без процессов. Логика и фолбэк на
+    реестр сохранены как были."""
     try:
-        result = subprocess.run(
-            ['netsh', 'interface', 'ipv6', 'show', 'interfaces'],
-            capture_output=True, text=True, errors="replace", shell=True,
-            creationflags=_NO_WINDOW
-        )
-        if result.stdout:
-            for line in result.stdout.splitlines():
-                if re.search(r'\b(connected|up|подключ|актив)', line, re.IGNORECASE):
-                    parts = line.split()
-                    # пропускаем заголовки и итоги: реальная строка начинается с ID интерфейса
-                    if len(parts) >= 4 and parts[0].isdigit() and int(parts[0]) > 1:
+        if psutil is None:
+            return _ipv6_registry_enabled()
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+        for name, snics in addrs.items():
+            st = stats.get(name)
+            if st is None or not st.isup or name.startswith("Loopback"):
+                continue
+            for a in snics:
+                if a.family == socket.AF_INET6:
+                    # отрезаем зону интерфейса: fe80::1%12 -> fe80::1
+                    if a.address.split('%')[0] != '::1':
                         return True
-            # если строки не распарсились, падаем на реестр
         return _ipv6_registry_enabled()
     except Exception:
         return _ipv6_registry_enabled()
@@ -617,6 +627,30 @@ def _ipv6_registry_enabled():
     """Проверка через реестр. DisabledComponents — битовая маска, а не флаг.
     Полностью отключает IPv6 только значение 0xFF (или 0x11/0x21 в связке с
     включенной политикой). Ненулевое значение само по себе НЕ означает отключение."""
+    value = _read_disabled_components()
+    if value is None:
+        return True
+    # 0xFF и 0x11/0x21 с политикой — фактическое отключение;
+    # остальные значения (например 0x20 = prefer IPv4) IPv6 НЕ отключают
+    return value != 0xFF
+
+
+def _read_disabled_components():
+    """Значение DisabledComponents (int) или None, если ключа нет/не прочитать.
+
+    Читаем через winreg (stdlib) — 0 мс и без subprocess. `reg query` оставлен
+    аварийным путём на случай, если winreg недоступен."""
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters") as key:
+                value, _ = winreg.QueryValueEx(key, "DisabledComponents")
+                return int(value)
+        except FileNotFoundError:
+            return None          # ключа нет — IPv6 не отключали
+        except OSError:
+            pass                 # нет доступа/иная ошибка — пробуем reg query
     try:
         result = subprocess.run([
             'reg', 'query',
@@ -624,17 +658,13 @@ def _ipv6_registry_enabled():
             '/v', 'DisabledComponents'
         ], capture_output=True, text=True, errors="replace", shell=True,
            creationflags=_NO_WINDOW)
-        if 'DisabledComponents' in result.stdout:
-            match = re.search(r'DisabledComponents\s+REG_DWORD\s+0x([0-9a-fA-F]+)', result.stdout)
-            if match:
-                value = int(match.group(1), 16)
-                # 0xFF и 0x11/0x21 с политикой — фактическое отключение;
-                # остальные значения (например 0x20 = prefer IPv4) IPv6 НЕ отключают
-                if value == 0xFF:
-                    return False
-        return True
+        match = re.search(r'DisabledComponents\s+REG_DWORD\s+0x([0-9a-fA-F]+)',
+                          result.stdout)
+        if match:
+            return int(match.group(1), 16)
     except Exception:
-        return True
+        pass
+    return None
 
 
 def disable_ipv6():
