@@ -28,10 +28,13 @@
 > **Примечание:** Приложению требуются привилегии администратора для управления Windows-службами. Оно автоматически запросит повышение прав, если запущено не от имени администратора.
 
 ##  Сборка
-Для создания автономного .exe используйте следующую команду:
-```bash
-pyinstaller --onedir --noconfirm --noconsole --name SakuraFlow --manifest manifest.xml --add-data "icons;icons" --add-data "zapret;zapret" --add-data "src;src" --icon=icons/sakura.ico --version-file=version.py src/main.py
-```
+Из корня репозитория (Windows, Python 3.10+):
+
+```powershell
+python -m pip install -r requirements.txt
+python src\build.py
+
+
 
 ##  Благодарности
 - **bol-van** — за создание мощного движка zapret

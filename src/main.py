@@ -28,12 +28,12 @@ else:
 
 try:
     import src  
-    sys.modules['src'] = src    
+    sys.modules['src'] = src         
     from src import admin, ui, config, service, tools, state, autostart
 except ImportError:
     import admin, ui, config, service, tools, state, autostart
 
-def _set_defaults():
+def _set_defaults():    
     app_state = state.load_state()
     if app_state.get("game_filter_mode") is None:
         tools.set_game_filter_mode("all")
@@ -184,7 +184,7 @@ def _main_inner():
             logging.warning("[MTPROTO] Первая попытка восстановить прокси не удалась, ретраим...")
             for _ in range(10):
                 time.sleep(1)
-                if tools.start_mtproto_proxy(port=port, host=host, secret=secret):
+                if tools.start_mtproto_proxy(port=port, host=host, secret=secret):  
                     logging.info("[MTPROTO] Прокси восстановлен повторной попыткой")
                     return
             logging.error("[MTPROTO] Не удалось восстановить прокси после 10 попыток")
