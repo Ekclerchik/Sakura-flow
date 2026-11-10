@@ -34,7 +34,7 @@
 python -m pip install -r requirements.txt
 python src\build.py
 
-
+```
 
 ##  Благодарности
 - **bol-van** — за создание мощного движка zapret
