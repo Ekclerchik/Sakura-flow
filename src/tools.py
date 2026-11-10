@@ -533,12 +533,16 @@ def _port_busy(port):
 
 
 def _wait_port_free(port, timeout=5.0):
-    """Ждём, пока порт освободится (не слушается). Возвращает True, если освободился."""
+    """Ждём, пока порт освободится (не слушается). Возвращает True, если освободился.
+
+    0.5с вместо 0.2с: каждый тик гоняет psutil.net_connections по ВСЕЙ таблице
+    подключений системы — на машинах с тысячами сокетов это реальные такты CPU,
+    а экономия времени ожидания тут ничего не даёт."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _port_busy(port):
             return True
-        time.sleep(0.2)
+        time.sleep(0.5)
     logging.warning(f"[MTPROTO] Port {port} не освободился за {timeout}s")
     return False
 
@@ -563,6 +567,10 @@ def _tasklist_winws_running():
 # (дешёвая, ~2мс) выполняется каждый раз, а тяжёлый tasklist — не чаще раза в TTL.
 _WINWS_FALLBACK_TTL = 5.0
 _winws_fallback = {"t": 0.0, "v": False}
+# Заточенный PID последнего найденного winws: вместо обхода ВСЕХ процессов
+# на каждый тик 1-секундного таймера проверяем один Process (~0.1мс).
+# Полный обход происходит только пока winws не найден.
+_winws_pid = {"v": None}
 
 
 def is_winws_running():
@@ -572,10 +580,24 @@ def is_winws_running():
     tasklist — он видал все процессы на машине. tasklist дорогой, поэтому не
     чаще раза в _WINWS_FALLBACK_TTL сек, иначе из 1-секундного таймера спамим
     subprocess'ами всё время, пока служба выключена."""
+    pid = _winws_pid["v"]
+    if pid and psutil is not None:
+        try:
+            name = psutil.Process(pid).name()
+            if name and name.lower() == 'winws.exe':
+                return True
+        except psutil.NoSuchProcess:
+            pass
+        except Exception:
+            pass
+        # PID унёс другой процесс (пере-использование) — сбрасываем.
+        _winws_pid["v"] = None
     try:
         if psutil is not None:
             for proc in psutil.process_iter(['name']):
-                if proc.info['name'] and proc.info['name'].lower() == 'winws.exe':
+                name = proc.info['name']
+                if name and name.lower() == 'winws.exe':
+                    _winws_pid["v"] = proc.pid
                     return True
     except Exception:
         pass
@@ -800,7 +822,12 @@ def set_game_filter_mode(mode):
 def get_ipset_status():
     if not IPSET_PATH.exists():
         return "any"
-    text = IPSET_PATH.read_text(encoding="utf-8").strip()
+    # ipset-all.txt после "загрузить" содержит МногомЕГАБАЙТОВЫЙ список — но
+    # все sentinel-значения ("0.0.0.0/0", "203.0.113.113/32") помещаются в
+    # первые десятки байт. Раньше read_text() материализовал несколько МБ строк
+    # и до 3 раза за одно клик по кнопке (get/verify внутри set_ipset_mode).
+    with open(IPSET_PATH, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read(128).strip()
     if not text or text == "0.0.0.0/0":
         return "any"
     if text == "203.0.113.113/32":
@@ -812,12 +839,17 @@ def set_ipset_mode(mode):
     IPSET_PATH.parent.mkdir(parents=True, exist_ok=True)
     backup = IPSET_PATH.with_suffix(".txt.backup")
 
+    if mode in ("any", "none"):
+        # Один вызов вместо двух: раньше status читался и в if, и в verify.
+        status = get_ipset_status()
+        need_backup = status == "loaded"
+
     if mode == "any":
-        if get_ipset_status() == "loaded":
+        if need_backup:
             IPSET_PATH.replace(backup)
         IPSET_PATH.write_text("0.0.0.0/0\n", encoding="utf-8")
     elif mode == "none":
-        if get_ipset_status() == "loaded":
+        if need_backup:
             IPSET_PATH.replace(backup)
         IPSET_PATH.write_text("203.0.113.113/32\n", encoding="utf-8")
     elif mode == "loaded":

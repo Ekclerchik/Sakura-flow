@@ -27,7 +27,7 @@ if __name__ == '__main__' and (__package__ is None or __package__ == ''):
 try:
     from src.proxy.utils import *
     from src.proxy.stats import stats
-    from src.proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
+    from src.proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, shutdown_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
     from src.proxy.bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
     from src.proxy.raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
     from src.proxy.fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
@@ -35,7 +35,7 @@ try:
 except ImportError:
     from proxy.utils import *
     from proxy.stats import stats
-    from proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
+    from proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, shutdown_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
     from proxy.bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
     from proxy.raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
     from proxy.fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
@@ -46,8 +46,8 @@ log = logging.getLogger('tg-mtproto-proxy')
 
 DC_FAIL_COOLDOWN = 30.0
 WS_FAIL_TIMEOUT = 2.0
-ws_blacklist: Set[Tuple[int, bool]] = set()
-dc_fail_until: Dict[Tuple[int, bool], float] = {}
+ws_blacklist: Set[str] = set()
+dc_fail_until: Dict[str, float] = {}
 
 
 def _try_handshake(handshake: bytes, secret: bytes) -> Optional[Tuple[int, bool, bytes, bytes]]:
@@ -121,10 +121,39 @@ def _ws_domains(dc: int, is_media) -> List[str]:
 
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
-    
+    # Idle-соединения нельзя держать вечно: `get()` чистит их только когда
+    # приходит новый клиент, а без трафика протухшие сокеты жили в пуле до
+    # остановки прокси. Фоновый сборщик закрывает их по возрасту.
+    REAP_INTERVAL = 30.0
+
     def __init__(self):
         self._idle: Dict[Tuple[int, bool], deque] = {}
         self._refilling: Set[Tuple[int, bool]] = set()
+        # Сильные ссылки на служебные задачи: event loop держит задачи только
+        # слабо, и create_task() без ссылки мог быть собран GC вместе с
+        # недоделанным соединением.
+        self._tasks: Set[asyncio.Task] = set()
+
+    def _spawn(self, coro) -> None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            # loop уже закрыт — корутину не запускаем
+            close = getattr(coro, 'close', None)
+            if close is not None:
+                close()
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            pass
 
     async def get(self, dc: int, is_media: bool,
                   target_ip: str, domains: List[str]
@@ -141,7 +170,8 @@ class _WsPool:
             age = now - created
             if (age > self.WS_POOL_MAX_AGE or ws._closed
                     or ws.writer.transport.is_closing()):
-                asyncio.create_task(self._quiet_close(ws))
+                # abort() возвращает сокет и буферы сразу, без ожидания
+                ws.abort()
                 continue
             stats.pool_hits += 1
             log.debug("WS pool hit DC%d%s (age=%.1fs, left=%d)",
@@ -157,7 +187,7 @@ class _WsPool:
         if key in self._refilling:
             return
         self._refilling.add(key)
-        asyncio.create_task(self._refill(key, target_ip, domains))
+        self._spawn(self._refill(key, target_ip, domains))
 
     async def _refill(self, key, target_ip, domains):
         dc, is_media = key
@@ -172,10 +202,18 @@ class _WsPool:
             for t in tasks:
                 try:
                     ws = await t
-                    if ws:
-                        bucket.append((ws, time.monotonic()))
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    pass
+                    ws = None
+                if ws is None:
+                    continue
+                # Пул могли сбросить/пересоздать, пока шло подключение —
+                # в этом случае соединение уже никому не принадлежит.
+                if self._idle.get(key) is not bucket or ws._closed:
+                    ws.abort()
+                    continue
+                bucket.append((ws, time.monotonic()))
             log.debug("WS pool refilled DC%d%s: %d ready",
                       dc, 'm' if is_media else '', len(bucket))
         finally:
@@ -199,19 +237,26 @@ class _WsPool:
         tasks = {asyncio.create_task(_try(d)) for d in domains}
         pending = set(tasks)
 
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                try:
-                    result = t.result()
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        result = t.result()
+                    except Exception:
+                        continue
                     if result is not None:
-                        for p in pending:
-                            p.cancel()
                         return result
-                except WsHandshakeError:
-                    pass
-
-        return None
+            return None
+        finally:
+            # Отменённые «проигравшие» задачи обязаны быть дожданы: иначе
+            # наполовину открытый ssl-транспорт висит до сборки мусора.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     async def _quiet_close(ws):
@@ -219,6 +264,33 @@ class _WsPool:
             await ws.close()
         except Exception:
             pass
+
+    def _reap_now(self) -> None:
+        now = time.monotonic()
+        for key, bucket in list(self._idle.items()):
+            alive = deque()
+            for ws, created in bucket:
+                if (now - created > self.WS_POOL_MAX_AGE or ws._closed
+                        or ws.writer.transport.is_closing()):
+                    ws.abort()
+                else:
+                    alive.append((ws, created))
+            # лишние сверх актуального pool_size (например, его уменьшили)
+            while len(alive) > max(0, proxy_config.pool_size):
+                ws, _ = alive.pop()
+                ws.abort()
+            if alive:
+                self._idle[key] = alive
+            else:
+                self._idle.pop(key, None)
+
+    async def reap(self):
+        while True:
+            await asyncio.sleep(self.REAP_INTERVAL)
+            try:
+                self._reap_now()
+            except Exception:
+                log.debug("WS pool reap failed", exc_info=True)
 
     async def warmup(self, dc_redirects: Dict[int, Optional[str]]):
         for dc, target_ip in dc_redirects.items():
@@ -230,8 +302,26 @@ class _WsPool:
         log.info("WS pool warmup started for %d DC(s)", len(dc_redirects))
 
     def reset(self):
+        """Сбросить пул и ЗАКРЫТЬ все idle-соединения.
+
+        Раньше здесь был просто clear(): сокеты (ssl-транспорты) оставались
+        жить до сборщика мусора, а при каждом старте/останове прокси
+        (перезапуск, пробуждение ПК) память процесса росла.
+        """
+        for bucket in self._idle.values():
+            for ws, _created in bucket:
+                ws.abort()
         self._idle.clear()
         self._refilling.clear()
+
+    async def aclose(self):
+        self.reset()
+        tasks = [t for t in self._tasks if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
 
 _ws_pool = _WsPool()
 
@@ -343,9 +433,17 @@ async def _handle_client(reader, writer, secret: bytes):
             stats.connections_bad += 1
             log.debug("[%s] bad handshake (wrong secret or proto)", label)
             try:
+                # Дочитываем остаток «в никуда», чтобы клиент не получил RST,
+                # но с жёстким лимитом: без него соединение с мусором на входе
+                # жило вечно и держало буферы reader'а (утечка при скане порта).
                 drain_src = tls_stream or reader
-                while await drain_src.read(4096):
-                    pass
+                drained = 0
+                while drained < 65536:
+                    chunk = await asyncio.wait_for(drain_src.read(4096),
+                                                   timeout=1.0)
+                    if not chunk:
+                        break
+                    drained += len(chunk)
             except Exception:
                 pass
             return
@@ -460,30 +558,50 @@ async def _handle_client(reader, writer, secret: bytes):
                     return ('error', exc, domain)
 
             tasks = [asyncio.create_task(_try_domain(d)) for d in domains]
-            for coro in asyncio.as_completed(tasks):
-                status, result, domain = await coro
-                if status == 'ok':
-                    ws = result
-                    all_redirects = False
-                    break
-                stats.ws_errors += 1
-                if status == 'redirect':
-                    ws_failed_redirect = True
-                    log.warning("[%s] DC%d%s got %d from %s -> %s",
-                                label, dc, media_tag,
-                                result.status_code, domain,
-                                result.location or '?')
-                else:
-                    all_redirects = False
-                    if isinstance(result, WsHandshakeError):
-                        log.warning("[%s] DC%d%s WS handshake: %s",
-                                    label, dc, media_tag, result.status_line)
-                    else:
-                        log.warning("[%s] DC%d%s WS connect failed: %s",
-                                    label, dc, media_tag, result)
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
+            pending = set(tasks)
+            try:
+                while pending and ws is None:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            status, result, domain = t.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            stats.ws_errors += 1
+                            all_redirects = False
+                            log.warning("[%s] DC%d%s WS connect failed: %s",
+                                        label, dc, media_tag, exc)
+                            continue
+                        if status == 'ok':
+                            ws = result
+                            all_redirects = False
+                            break
+                        stats.ws_errors += 1
+                        if status == 'redirect':
+                            ws_failed_redirect = True
+                            log.warning("[%s] DC%d%s got %d from %s -> %s",
+                                        label, dc, media_tag,
+                                        result.status_code, domain,
+                                        result.location or '?')
+                        else:
+                            all_redirects = False
+                            if isinstance(result, WsHandshakeError):
+                                log.warning("[%s] DC%d%s WS handshake: %s",
+                                            label, dc, media_tag,
+                                            result.status_line)
+                            else:
+                                log.warning("[%s] DC%d%s WS connect failed: %s",
+                                            label, dc, media_tag, result)
+            finally:
+                # Проигравшие задачи отменяем И дожидаемся: их RawWebSocket.connect
+                # при отмене закрывает свой транспорт, иначе сокет с TLS-буферами
+                # висел до GC (накопление памяти при каждом переподключении).
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         if ws is None:
             if ws_failed_redirect and all_redirects:
@@ -522,11 +640,19 @@ async def _handle_client(reader, writer, secret: bytes):
         except Exception:
             pass
 
-        await ws.send(relay_init)
-
-        await bridge_ws_reencrypt(clt_reader, clt_writer, ws, label,
-                                   dc=dc, is_media=is_media,
-                                   ctx=ctx, splitter=splitter)
+        # Соединение из пула может оказаться уже закрытым Telegram'ом: тогда
+        # ws.send() бросит исключение. Без finally такой WS (ssl-транспорт)
+        # оставался жить до сборщика мусора — это и была утечка.
+        try:
+            await ws.send(relay_init)
+            await bridge_ws_reencrypt(clt_reader, clt_writer, ws, label,
+                                      dc=dc, is_media=is_media,
+                                      ctx=ctx, splitter=splitter)
+        finally:
+            try:
+                await ws.close()
+            except BaseException:
+                pass
 
     except asyncio.TimeoutError:
         log.warning("[%s] timeout during handshake", label)
@@ -547,7 +673,10 @@ async def _handle_client(reader, writer, secret: bytes):
         stats.connections_active -= 1
         try:
             writer.close()
-            await writer.wait_closed()
+            # wait_closed БЕЗ таймаута при зависшем сокете держал бы
+            # корутину _handle_client, её CryptoCtx (4 AES-контекста) и задачу
+            # бесконечно — не путать с graceful-close активного клиента.
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
         except BaseException:
             pass
 
@@ -566,6 +695,8 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     dc_fail_until.clear()
     _client_tasks.clear()
 
+    # Подача выдачи доменов CF фоном — ТОЛЬКО пока прокси работает; в finally
+    # это глушится, чтобы не качать GitHub из «офнутого» приложения.
     if proxy_config.fallback_cfproxy:
         user = proxy_config.cfproxy_user_domain
         if user:
@@ -644,8 +775,17 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             raise
 
     log_stats_task = asyncio.create_task(log_stats())
+    reap_task = asyncio.create_task(_ws_pool.reap())
 
-    await _ws_pool.warmup(proxy_config.dc_redirects)
+    # Прогрев ТОЛЬКО не-media на redirected DC: раньше warmup() коннектили
+    # (все DC) x (оба media) — idle-сокеты держат reader-буферы; недостающие
+    # поднимутся лениво по первому get() (_schedule_refill уже есть).
+    for dc, target_ip in proxy_config.dc_redirects.items():
+        if target_ip is None:
+            continue
+        _ws_pool._schedule_refill((dc, False), target_ip,
+                                  _ws_domains(dc, False))
+    log.info("WS pool warmup (lazy: non-media only) scheduled")
 
     try:
         async with server:
@@ -697,6 +837,22 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             await log_stats_task
         except asyncio.CancelledError:
             pass
+        reap_task.cancel()
+        try:
+            await reap_task
+        except asyncio.CancelledError:
+            pass
+        # Пул: закрыть все idle WS и отменить/дождаться фоновых подключений.
+        try:
+            await _ws_pool.aclose()
+        except Exception:
+            log.debug("WS pool close failed", exc_info=True)
+        # CF-домены refresher: прокси останавливается — поток не должен
+        # продолжать качать GitHub раз в час.
+        try:
+            shutdown_cfproxy_domain_refresh()
+        except Exception:
+            log.debug("cfproxy refresh shutdown failed", exc_info=True)
         # Задачи WS-пула (_refill/_connect_one) висят с таймаутами до 8с и без
         # отмены loop закрывается с «pending» → шум "Task was destroyed...".
         # Отменяем все прочие задачи и ждём их, чтобы шатдаун был чистым.

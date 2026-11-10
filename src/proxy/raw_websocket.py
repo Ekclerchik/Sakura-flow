@@ -20,6 +20,41 @@ _st_Q = struct.Struct('>Q')
 
 _ssl_ctx = ssl.create_default_context()
 
+# Предел на размер одного WS-фрейма. Длину фрейма диктует удалённая сторона, и
+# без проверки `readexactly(length)` может попросить гигабайты (ОЗУ процесса
+# мгновенно уходит в OOM). Легальные MTProto-сообщения мельче 1 МБ; 8 МБ — с
+# большим запасом.
+MAX_FRAME_SIZE = 8 * 1024 * 1024
+
+# После записи фрейма не копим больше этого в буфере транспорта: иначе при
+# медленном аплинке (отдача файла) буфер растёт без ограничений и «утекает»
+# память. Это же лечит и общий рост при долгой сессии.
+WRITE_BUFFER_HIGH_WATER = 256 * 1024
+
+
+def _abort_writer(writer) -> None:
+    """Мгновенно освободить транспорт, не ожидая корректного TLS-shutdown.
+
+    Нужно на всех путях ошибки/отмены connect(): иначе недоделанный
+    ssl-транспорт (сокет + буферы) живёт до сборщика мусора. При частых
+    переподключениях Telegram это и есть наблюдаемая «утечка» памяти и
+    сокетов в CLOSE_WAIT.
+    """
+    if writer is None:
+        return
+    transport = None
+    try:
+        transport = writer.transport
+    except Exception:
+        transport = None
+    try:
+        if transport is not None:
+            transport.abort()
+        else:
+            writer.close()
+    except Exception:
+        pass
+
 
 class WsHandshakeError(Exception):
     def __init__(self, status_code: int, status_line: str,
@@ -36,12 +71,19 @@ class WsHandshakeError(Exception):
 
 
 def _xor_mask(data: bytes, mask: bytes) -> bytes:
+    """XOR-маска без по-байтового питоновского цикла.
+
+    Раньше: result[i] ^= mask[i & 3] — 131072 итераций интерпретатора на
+    каждый 64KB-чанк аплинка (x2 с bytes(result)). Теперь: данные и
+    периодическая маска переводятся в big-int, XOR выполняется одним
+    машинным действием в CPython. Корректность: little-endian XOR big-int
+    == потактовый XOR байтов."""
     if not data:
         return data
-    result = bytearray(data)
-    for i in range(len(result)):
-        result[i] ^= mask[i & 3]
-    return bytes(result)
+    n = len(data)
+    m = (mask * ((n >> 2) + 1))[:n]
+    return (int.from_bytes(data, 'little')
+            ^ int.from_bytes(m, 'little')).to_bytes(n, 'little')
 
 
 def set_sock_opts(transport, buffer_size):
@@ -77,33 +119,37 @@ class RawWebSocket:
 
     @staticmethod
     async def connect(host: str, domain: str, timeout: float = 10.0) -> 'RawWebSocket':
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, 443, ssl=_ssl_ctx,
-                                    server_hostname=domain),
-            timeout=min(timeout, 10))
-        
-        set_sock_opts(writer.transport, proxy_config.buffer_size)
-
-        ws_key = base64.b64encode(os.urandom(16)).decode()
-
-        req = (
-            f'GET /apiws HTTP/1.1\r\n'
-            f'Host: {domain}\r\n'
-            f'Upgrade: websocket\r\n'
-            f'Connection: Upgrade\r\n'
-            f'Sec-WebSocket-Key: {ws_key}\r\n'
-            f'Sec-WebSocket-Version: 13\r\n'
-            f'Sec-WebSocket-Protocol: binary\r\n'
-            f'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-            f'AppleWebKit/537.36 (KHTML, like Gecko) '
-            f'Chrome/131.0.0.0 Safari/537.36\r\n'
-            f'\r\n'
-        )
-        writer.write(req.encode())
-        await writer.drain()
-
-        response_lines: list[str] = []
+        # writer остаётся в этой переменной, пока владение не передано объекту
+        # RawWebSocket. Любой выход (ошибка, таймаут, отмена) обязан закрыть
+        # транспорт — см. except ниже.
+        writer: Optional[asyncio.StreamWriter] = None
         try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, 443, ssl=_ssl_ctx,
+                                        server_hostname=domain),
+                timeout=min(timeout, 10))
+
+            set_sock_opts(writer.transport, proxy_config.buffer_size)
+
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+
+            req = (
+                f'GET /apiws HTTP/1.1\r\n'
+                f'Host: {domain}\r\n'
+                f'Upgrade: websocket\r\n'
+                f'Connection: Upgrade\r\n'
+                f'Sec-WebSocket-Key: {ws_key}\r\n'
+                f'Sec-WebSocket-Version: 13\r\n'
+                f'Sec-WebSocket-Protocol: binary\r\n'
+                f'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                f'AppleWebKit/537.36 (KHTML, like Gecko) '
+                f'Chrome/131.0.0.0 Safari/537.36\r\n'
+                f'\r\n'
+            )
+            writer.write(req.encode())
+            await writer.drain()
+
+            response_lines: list[str] = []
             while True:
                 line = await asyncio.wait_for(reader.readline(),
                                               timeout=timeout)
@@ -111,39 +157,57 @@ class RawWebSocket:
                     break
                 response_lines.append(
                     line.decode('utf-8', errors='replace').strip())
-        except asyncio.TimeoutError:
-            writer.close()
+
+            if not response_lines:
+                raise WsHandshakeError(0, 'empty response')
+
+            first_line = response_lines[0]
+            parts = first_line.split(' ', 2)
+            try:
+                status_code = int(parts[1]) if len(parts) >= 2 else 0
+            except ValueError:
+                status_code = 0
+
+            if status_code == 101:
+                ws = RawWebSocket(reader, writer)
+                writer = None  # владение транспортом перешло к RawWebSocket
+                return ws
+
+            headers: dict[str, str] = {}
+            for hl in response_lines[1:]:
+                if ':' in hl:
+                    k, v = hl.split(':', 1)
+                    headers[k.strip().lower()] = v.strip()
+
+            raise WsHandshakeError(status_code, first_line, headers,
+                                   location=headers.get('location'))
+        except BaseException:
+            _abort_writer(writer)
             raise
-
-        if not response_lines:
-            writer.close()
-            raise WsHandshakeError(0, 'empty response')
-
-        first_line = response_lines[0]
-        parts = first_line.split(' ', 2)
-        try:
-            status_code = int(parts[1]) if len(parts) >= 2 else 0
-        except ValueError:
-            status_code = 0
-
-        if status_code == 101:
-            return RawWebSocket(reader, writer)
-
-        headers: dict[str, str] = {}
-        for hl in response_lines[1:]:
-            if ':' in hl:
-                k, v = hl.split(':', 1)
-                headers[k.strip().lower()] = v.strip()
-
-        writer.close()
-        raise WsHandshakeError(status_code, first_line, headers,
-                                location=headers.get('location'))
 
     async def send(self, data: bytes):
         if self._closed:
             raise ConnectionError("WebSocket closed")
-        frame = self._build_frame(self.OP_BINARY, data, mask=True)
-        self.writer.write(frame)
+        length = len(data)
+        if length < 1500:
+            # Мелкий фрейм дешевле одной аллокацией; большие чанки не копируем
+            # ещё раз в конкатенацию header+payload — asyncio-транспорт
+            # принимает несколько write() без дополнительных копий данных.
+            self.writer.write(self._build_frame(self.OP_BINARY, data, mask=True))
+        else:
+            fb = 0x80 | self.OP_BINARY
+            mask_key = os.urandom(4)
+            if length < 126:
+                self.writer.write(_st_BB4s.pack(fb, 0x80 | length, mask_key))
+            elif length < 65536:
+                self.writer.write(_st_BBH4s.pack(fb, 0x80 | 126, length, mask_key))
+            else:
+                self.writer.write(_st_BBQ4s.pack(fb, 0x80 | 127, length, mask_key))
+            self.writer.write(_xor_mask(data, mask_key))
+        # Без этого буфер транспорта рос бы неограниченно при отдаче данных от
+        # клиента (аплинк медленнее, чем читает tcp_to_ws) — главный источник
+        # роста ОЗУ во время загрузок.
+        await self._drain_if_needed()
 
     async def send_batch(self, parts: List[bytes]):
         if self._closed:
@@ -152,6 +216,18 @@ class RawWebSocket:
             self.writer.write(
                 self._build_frame(self.OP_BINARY, part, mask=True))
         await self.writer.drain()
+
+    async def drain(self):
+        await self.writer.drain()
+
+    async def _drain_if_needed(self):
+        try:
+            pending = self.writer.transport.get_write_buffer_size()
+        except (AttributeError, NotImplementedError):
+            await self.writer.drain()
+            return
+        if pending >= WRITE_BUFFER_HIGH_WATER:
+            await self.writer.drain()
 
     async def recv(self) -> Optional[bytes]:
         while not self._closed:
@@ -192,14 +268,23 @@ class RawWebSocket:
         try:
             self.writer.write(
                 self._build_frame(self.OP_CLOSE, b'', mask=True))
-            await self.writer.drain()
-        except Exception:
+            await asyncio.wait_for(self.writer.drain(), timeout=1.0)
+        except BaseException:
             pass
         try:
             self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+        except BaseException:
             pass
+        finally:
+            # Гарантированно отпускаем транспорт: если TLS-shutdown не
+            # завершился за 2с, сокет и буферы не должны ждать GC.
+            _abort_writer(self.writer)
+
+    def abort(self):
+        """Закрыть без ожидания (пул, отмена, ошибки)."""
+        self._closed = True
+        _abort_writer(self.writer)
 
     @staticmethod
     def _build_frame(opcode: int, data: bytes,
@@ -228,6 +313,9 @@ class RawWebSocket:
             length = _st_H.unpack(await self.reader.readexactly(2))[0]
         elif length == 127:
             length = _st_Q.unpack(await self.reader.readexactly(8))[0]
+        if length > MAX_FRAME_SIZE:
+            raise ConnectionError(
+                f"WebSocket frame too large: {length} bytes")
         if hdr[1] & 0x80:
             mask_key = await self.reader.readexactly(4)
             payload = await self.reader.readexactly(length)

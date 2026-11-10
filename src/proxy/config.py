@@ -41,7 +41,10 @@ class ProxyConfig:
     secret: str = field(default_factory=lambda: os.urandom(16).hex())
     dc_redirects: Dict[int, str] = field(default_factory=lambda: {4: '149.154.167.91'})
     buffer_size: int = 256 * 1024
-    pool_size: int = 4
+    # 2 вместо 4: каждый idle WS-сокет держит read-буферы, а тёплый пул
+    # прогревается на ((dc) x media) комбинации. 2 на направление хватает,
+    # недостающие поднимаются лениво по первому get().
+    pool_size: int = 2
     fallback_cfproxy: bool = True
     fallback_cfproxy_priority: bool = True
     cfproxy_user_domain: str = ''
@@ -105,7 +108,6 @@ def start_cfproxy_domain_refresh() -> None:
     _refresh_stop = threading.Event()
     stop = _refresh_stop
     epoch = _refresh_epoch
-    
     # Инициализируем balancer дефолтными доменами
     try:
         from .balancer import balancer
@@ -121,6 +123,20 @@ def start_cfproxy_domain_refresh() -> None:
             refresh_cfproxy_domains()
 
     threading.Thread(target=_loop, daemon=True, name='cfproxy-domains-refresh').start()
+
+
+def shutdown_cfproxy_domain_refresh() -> None:
+    """Остановить фоновый refresher при выключении прокси: без этого поток
+    оставался жить после стопа и продолжал раз в час качать GitHub (URL-открывания
+    + TLS-потоки прямо из «оф-нутого» приложения).
+
+    Механика: bump _refresh_epoch (любой запущенный _loop сравнивает свою
+    snapshot'у epoch и смотрит на это) плюс set текущего Event — ссылку храним
+    в globals();начатая перед этим Event - это тот самый объект."""
+    stop_event = globals().get('_refresh_stop')
+    if stop_event is not None:
+        stop_event.set()
+    globals()['_refresh_epoch'] = globals().get('_refresh_epoch', 0) + 1
 
 
 def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:

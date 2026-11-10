@@ -37,7 +37,19 @@ class CryptoCtx:
 
 
 class MsgSplitter:
-    __slots__ = ('_dec', '_proto', '_cipher_buf', '_plain_buf', '_disabled')
+    __slots__ = ('_dec', '_proto', '_cipher_buf', '_plain_buf', '_off', '_disabled')
+
+    # Верхняя граница на буферизацию. Длину пакета берём из расшифрованного
+    # заголовка (её пишет клиент), поэтому без лимита одно «пакетное» сообщение
+    # с длиной в сотни МБ раздувает оба буфера до OOM. Легальные MTProto-пакеты
+    # заметно меньше; при превышении просто отключаем нарезку (passthrough).
+    MAX_BUFFER = 4 * 1024 * 1024
+
+    # Компакция буферов: раньше del buf[:packet_len] на каждый пакет двигал
+    # ВЕСЬ остаток bytearray (до 12 МБ memmove на 64KB-чанке — квадратичное
+    # поведение с потолком MAX_BUFFER). Теперь потребление идёт по offset, а
+    # редкая компакция происходит раз за ~192КБ съеденного.
+    _COMPACT_LIMIT = 192 * 1024
 
     def __init__(self, relay_init: bytes, proto_int: int):
         cipher = Cipher(algorithms.AES(relay_init[8:40]),
@@ -47,7 +59,16 @@ class MsgSplitter:
         self._proto = proto_int
         self._cipher_buf = bytearray()
         self._plain_buf = bytearray()
+        self._off = 0
         self._disabled = False
+
+    def _disable_and_flush(self) -> List[bytes]:
+        tail = bytes(self._cipher_buf[self._off:])
+        self._cipher_buf.clear()
+        self._plain_buf.clear()
+        self._off = 0
+        self._disabled = True
+        return [tail] if tail else []
 
     def split(self, chunk: bytes) -> List[bytes]:
         if not chunk:
@@ -58,46 +79,66 @@ class MsgSplitter:
         self._cipher_buf.extend(chunk)
         self._plain_buf.extend(self._dec.update(chunk))
 
+        if len(self._cipher_buf) - self._off > self.MAX_BUFFER:
+            log.debug("MsgSplitter: buffer %d B > limit -> passthrough",
+                      len(self._cipher_buf) - self._off)
+            return self._disable_and_flush()
+
         parts = []
-        while self._cipher_buf:
-            packet_len = self._next_packet_len()
+        off = self._off
+        while len(self._cipher_buf) - off > 0:
+            packet_len = self._next_packet_len(off)
             if packet_len is None:
+                if len(self._cipher_buf) - off > self.MAX_BUFFER:
+                    self._off = off
+                    parts += self._disable_and_flush()
                 break
             if packet_len <= 0:
-                parts.append(bytes(self._cipher_buf))
-                self._cipher_buf.clear()
-                self._plain_buf.clear()
-                self._disabled = True
+                self._off = off
+                parts += self._disable_and_flush()
                 break
-            parts.append(bytes(self._cipher_buf[:packet_len]))
-            del self._cipher_buf[:packet_len]
-            del self._plain_buf[:packet_len]
+            if packet_len > self.MAX_BUFFER:
+                log.debug("MsgSplitter: packet %d B > limit -> passthrough",
+                          packet_len)
+                self._off = off
+                parts += self._disable_and_flush()
+                break
+            parts.append(bytes(self._cipher_buf[off:off + packet_len]))
+            off += packet_len
+
+        # Компакция ОДИН раз за цикл, когда съедено много — а не на каждый пакет.
+        if off >= self._COMPACT_LIMIT:
+            del self._cipher_buf[:off]
+            del self._plain_buf[:off]
+            self._off = 0
+        else:
+            self._off = off
         return parts
 
     def flush(self) -> List[bytes]:
-        if not self._cipher_buf:
-            return []
-        tail = bytes(self._cipher_buf)
+        tail = bytes(self._cipher_buf[self._off:])
         self._cipher_buf.clear()
         self._plain_buf.clear()
-        return [tail]
+        self._off = 0
+        return [tail] if tail else []
 
-    def _next_packet_len(self) -> Optional[int]:
-        if not self._plain_buf:
+    def _next_packet_len(self, off: int) -> Optional[int]:
+        if len(self._plain_buf) <= off:
             return None
         if self._proto == PROTO_ABRIDGED_INT:
-            return self._next_abridged_len()
+            return self._next_abridged_len(off)
         if self._proto in (PROTO_INTERMEDIATE_INT,
                            PROTO_PADDED_INTERMEDIATE_INT):
-            return self._next_intermediate_len()
+            return self._next_intermediate_len(off)
         return 0
 
-    def _next_abridged_len(self) -> Optional[int]:
-        first = self._plain_buf[0]
+    def _next_abridged_len(self, off: int) -> Optional[int]:
+        first = self._plain_buf[off]
         if first in (0x7F, 0xFF):
-            if len(self._plain_buf) < 4:
+            if len(self._plain_buf) - off < 4:
                 return None
-            payload_len = int.from_bytes(self._plain_buf[1:4], 'little') * 4
+            payload_len = int.from_bytes(
+                self._plain_buf[off + 1:off + 4], 'little') * 4
             header_len = 4
         else:
             payload_len = (first & 0x7F) * 4
@@ -105,18 +146,19 @@ class MsgSplitter:
         if payload_len <= 0:
             return 0
         packet_len = header_len + payload_len
-        if len(self._plain_buf) < packet_len:
+        if len(self._plain_buf) - off < packet_len:
             return None
         return packet_len
 
-    def _next_intermediate_len(self) -> Optional[int]:
-        if len(self._plain_buf) < 4:
+    def _next_intermediate_len(self, off: int) -> Optional[int]:
+        if len(self._plain_buf) - off < 4:
             return None
-        payload_len = _st_I_le.unpack_from(self._plain_buf, 0)[0] & 0x7FFFFFFF
+        payload_len = _st_I_le.unpack_from(
+            self._plain_buf, off)[0] & 0x7FFFFFFF
         if payload_len <= 0:
             return 0
         packet_len = 4 + payload_len
-        if len(self._plain_buf) < packet_len:
+        if len(self._plain_buf) - off < packet_len:
             return None
         return packet_len
 
@@ -135,21 +177,29 @@ async def do_fallback(reader, writer, relay_init, label,
         methods.insert(0 if cf_first else 1, 'cf')
 
     for method in methods:
-        if method == 'cf':
-            ok = await _cfproxy_fallback(
-                reader, writer, relay_init, label,
-                dc=dc, is_media=is_media,
-                ctx=ctx, splitter=splitter)
-            if ok:
-                return True
-        elif method == 'tcp' and fallback_dst:
-            log.info("[%s] DC%d%s -> TCP fallback to %s:443",
-                     label, dc, media_tag, fallback_dst)
-            ok = await _tcp_fallback(
-                reader, writer, fallback_dst, 443,
-                relay_init, label, dc=dc, is_media=is_media, ctx=ctx)
-            if ok:
-                return True
+        try:
+            if method == 'cf':
+                ok = await _cfproxy_fallback(
+                    reader, writer, relay_init, label,
+                    dc=dc, is_media=is_media,
+                    ctx=ctx, splitter=splitter)
+                if ok:
+                    return True
+            elif method == 'tcp' and fallback_dst:
+                log.info("[%s] DC%d%s -> TCP fallback to %s:443",
+                         label, dc, media_tag, fallback_dst)
+                ok = await _tcp_fallback(
+                    reader, writer, fallback_dst, 443,
+                    relay_init, label, dc=dc, is_media=is_media, ctx=ctx)
+                if ok:
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # сбой одного способа не должен мешать следующему и не должен
+            # всплывать наружу, оставляя открытые сокеты
+            log.warning("[%s] DC%d%s %s fallback failed: %s",
+                        label, dc, media_tag, method, exc)
     return False
 
 
@@ -185,10 +235,18 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
         proxy_config.active_cfproxy_domain = chosen_domain
 
     stats.connections_cfproxy += 1
-    await ws.send(relay_init)
-    await bridge_ws_reencrypt(reader, writer, ws, label,
-                               dc=dc, is_media=is_media,
-                               ctx=ctx, splitter=splitter)
+    # ws обязан быть закрыт на любом пути: раньше сбой ws.send(relay_init) на
+    # протухшем CF-соединении оставлял ssl-транспорт жить до GC (утечка).
+    try:
+        await ws.send(relay_init)
+        await bridge_ws_reencrypt(reader, writer, ws, label,
+                                  dc=dc, is_media=is_media,
+                                  ctx=ctx, splitter=splitter)
+    finally:
+        try:
+            await ws.close()
+        except BaseException:
+            pass
     return True
 
 

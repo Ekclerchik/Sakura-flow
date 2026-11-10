@@ -29,6 +29,20 @@ except ImportError:
 
 _APP_ID = "Ekcler.SakuraFlow"
 
+# Единый иконка приложения: раньше setWindowIcon(QIcon(ICON_PATH)) создавал
+# НОВЫЙ QIcon (и декодировал .ico заново) в 5 местах (окно, трей, диалоги).
+_APP_ICON = None
+
+
+def _app_icon():
+    global _APP_ICON
+    if _APP_ICON is None:
+        try:
+            _APP_ICON = QIcon(str(ICON_PATH)) if ICON_PATH.exists() else QIcon()
+        except Exception:
+            _APP_ICON = QIcon()
+    return _APP_ICON
+
 # Иконки меню Старт/Стоп фиксированного размера 16x16. QMenu резервирует колонку
 # иконок, ТОЛЬКО если хотя бы у одного пункта есть иконка — при выкл (QIcon())
 # колонка схлопывалась и весь текст меню «прыгал» влево (сносило табуляцию).
@@ -92,7 +106,7 @@ class ListEditorWindow(QWidget):
             self._file_name = "list-exclude.txt"
         self._base_title = base_title
         self.setWindowTitle(base_title)
-        self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowIcon(_app_icon())
         self.setWindowFlags(Qt.Window)
         self.resize(600, 640)
         self.setMinimumSize(480, 520)
@@ -382,7 +396,7 @@ class NetworkToolsWindow(QWidget):
     def init_ui(self):
         self.setWindowTitle("Sakura Flow")
         self.setFixedSize(450, 800)
-        self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowIcon(_app_icon())
         self.setWindowFlags(Qt.Window)
         self.setStyleSheet("""
             QWidget { background-color: #0b0a12; color: #e8e8f0; font-family: 'Segoe UI'; }
@@ -752,6 +766,7 @@ class NetworkToolsWindow(QWidget):
             editor = ListEditorWindow(self.restart_func, list_type)
             setattr(self, attr, editor)
             editor.show()
+            _wake_taskbar_tagging()  # новое окно на панели задач
             qr = editor.frameGeometry()
             cp = QApplication.desktop().availableGeometry().center()
             qr.moveCenter(cp)
@@ -782,6 +797,13 @@ class NetworkToolsWindow(QWidget):
             state.save_state(tools_win_x=self.x(), tools_win_y=self.y())
         except Exception:
             pass
+        # Скрытое окно: нет смысла обновлять 1 Гц. Интервал таймера 5с
+        # (счётчик get_traffic_stats позволяет паузу — базовый _last_io живёт),
+        # «шпильку» гигантского дельта-значения гасим в showEvent.
+        try:
+            self.timer.setInterval(5000)
+        except Exception:
+            pass
         super().hideEvent(event)
 
     def showEvent(self, event):
@@ -804,6 +826,13 @@ class NetworkToolsWindow(QWidget):
         # пока окно было скрыто, _sync_ipv6_btn не вызывался (см. update_stats).
         self._ipv6_check_accum = 0
         self._sync_ipv6_btn()
+        # Скрытый период копили 5с-дельту: обновим базу _last_io молча, чтобы
+        # первый показ не показал гигантскую «шпильку» KB/s за 5с.
+        try:
+            self.timer.setInterval(1000)
+            tools.get_traffic_stats()
+        except Exception:
+            pass
 
     def update_stats(self):
         up, down = tools.get_traffic_stats()
@@ -909,41 +938,70 @@ class NetworkToolsWindow(QWidget):
 tools_window = None
 
 
+def _taskbar_structures():
+    """GUID/PROPVARIANT/PROPERTYKEY собираются ОДИН раз: раньше каждые 2с
+    tag_timer заново строил ctypes-классы внутри try (Structure-definitions
+    и GUID-константы), хотя окна метятся однократно."""
+    cached = getattr(_taskbar_structures, "_c", None)
+    if cached is not None:
+        return cached
+    from ctypes import (Structure, Union, c_void_p, c_wchar_p)
+    from ctypes import wintypes
+
+    class GUID(Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
+
+    class PROPERTYKEY(Structure):
+        _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+    class _PV_UNION(Union):
+        _fields_ = [("pwszVal", c_wchar_p)]
+
+    class PROPVARIANT(Structure):
+        _anonymous_ = ("_u",)
+        _fields_ = [("vt", wintypes.WORD),
+                    ("wReserved1", wintypes.WORD),
+                    ("wReserved2", wintypes.WORD),
+                    ("wReserved3", wintypes.WORD),
+                    ("_u", _PV_UNION)]
+
+    cached = dict(
+        GUID=GUID, PROPERTYKEY=PROPERTYKEY, PROPVARIANT=PROPVARIANT,
+        PP=POINTER,
+        IID_IPropertyStore=GUID(
+            0x886d8eeb, 0x8cf2, 0x4446,
+            (0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99)),
+        PKEY_AppUserModel_ID=PROPERTYKEY(
+            GUID(0x9f4c2855, 0x9f79, 0x4b39,
+                 (0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0x03)), 5),
+    )
+    _taskbar_structures._c = cached
+    return cached
+
+
+_tag_idle_passes = {"n": 0}
+
+
 def _tag_top_windows():
-    """Проставляет каждому верхнеуровневому окну свой AppUserModelID через
+    """Проставляет каждому верхнеуровневому окному свой AppUserModelID через
     SHGetPropertyStoreForWindow (PKEY_AppUserModel_ID). Без этого ПКМ-меню
     панели задач берёт имя из exe и пишет «python» — даже при установленном
-    AppUserModelID процесса. С тегом меню показывает «Sakura Flow»."""
+    AppUserModelID процесса. С тегом меню показывает «Sakura Flow».
+
+    Возвращает число заново помеченных окон: tag_timer глушится после нескольких
+    «пустых» проходов и возобновляется через _wake_taskbar_tagging при
+    создании новых окон."""
     try:
-        from ctypes import (POINTER, Structure, Union, CFUNCTYPE, byref, cast,
-                            c_void_p, c_wchar_p, c_ulong, c_long, windll)
-        from ctypes import wintypes
+        from ctypes import (CFUNCTYPE, byref, cast, POINTER, windll, c_void_p)
 
-        class GUID(Structure):
-            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
-                        ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
+        s = _taskbar_structures()
+        GUID, PROPERTYKEY, PROPVARIANT = (s["GUID"], s["PROPERTYKEY"],
+                                          s["PROPVARIANT"])
+        IID_IPropertyStore = s["IID_IPropertyStore"]
+        PKEY_AppUserModel_ID = s["PKEY_AppUserModel_ID"]
 
-        class PROPERTYKEY(Structure):
-            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
-
-        class _PV_UNION(Union):
-            _fields_ = [("pwszVal", c_wchar_p)]
-
-        class PROPVARIANT(Structure):
-            _anonymous_ = ("_u",)
-            _fields_ = [("vt", wintypes.WORD),
-                        ("wReserved1", wintypes.WORD),
-                        ("wReserved2", wintypes.WORD),
-                        ("wReserved3", wintypes.WORD),
-                        ("_u", _PV_UNION)]
-
-        IID_IPropertyStore = GUID(
-            0x886d8eeb, 0x8cf2, 0x4446,
-            (0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99))
-        PKEY_AppUserModel_ID = PROPERTYKEY(
-            GUID(0x9f4c2855, 0x9f79, 0x4b39,
-                 (0xa8, 0xd0, 0xe1, 0xd4, 0x2d, 0xe1, 0xd5, 0x03)), 5)
-
+        tagged = 0
         for w in QApplication.topLevelWidgets():
             if not w.isWindow() or getattr(w, "_taskbar_tagged", False):
                 continue
@@ -965,18 +1023,31 @@ def _tag_top_windows():
                     c_long, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT)))
                 setvalue(ps, byref(PKEY_AppUserModel_ID), byref(pv))
                 w._taskbar_tagged = True
+                tagged += 1
             finally:
                 if vtbl:
                     release = cast(vtbl[2], CFUNCTYPE(c_ulong, c_void_p))
                     release(ps)
+        return tagged
     except Exception as e:
         logging.warning(f"[TASKBAR] tag windows: {e}")
+        return 0
+
+
+def _wake_taskbar_tagging():
+    """Новое окно на подходе — включить/сбросить тег-таймер, если он был
+    погашен после серии пустых проходов."""
+    _tag_idle_passes["n"] = 0
+    t = globals().get("_tag_timer")
+    if t is not None and not t.isActive():
+        t.start(2000)
 
 
 def open_tools(restart_func):
     global tools_window
     if tools_window is None:
         tools_window = NetworkToolsWindow(restart_func)
+        _wake_taskbar_tagging()
     tools_window.show()
     tools_window.activateWindow()
 
@@ -1019,7 +1090,7 @@ def _show_first_run():
     )
     dlg = _ReadBlock()
     dlg.setWindowTitle("Sakura Flow")
-    dlg.setWindowIcon(QIcon(str(ICON_PATH)))
+    dlg.setWindowIcon(_app_icon())
     dlg.setModal(True)
     dlg.setFixedWidth(480)
     # без крестика и без закрытия по Esc — читать придётся
@@ -1053,13 +1124,13 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     logging.info("[TRAY] creating QApplication...")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app.setWindowIcon(_app_icon())
     pal = app.palette()
     pal.setColor(QPalette.PlaceholderText, QColor("#9a9aae"))
     app.setPalette(pal)
 
     logging.info("[TRAY] creating tray icon...")
-    tray = QSystemTrayIcon(QIcon(str(ICON_PATH)))
+    tray = QSystemTrayIcon(_app_icon())
     tray.show()
     logging.info("[TRAY] tray shown")
 
@@ -1095,7 +1166,11 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         if app_state["last_bat"]:
             for b in bat_files:
                 if b.stem == app_state["last_bat"]:
-                    threading.Thread(target=lambda b=b: service.start_service(b, b.stem), daemon=True).start()
+                    # force=True: quick_restart зовут из Network Tools после смены
+                    # списков/ipset/DNS — нужен РЕАЛЬНЫЙ перезапуск службы, а не
+                    # «уже работает, пропусти» (start_service(force=False) после
+                    # ребута как раз пропускает пересоздание работающей стратегии).
+                    threading.Thread(target=lambda b=b: service.start_service(b, b.stem, force=True), daemon=True).start()
                     break
 
     # флаг занятости: пока вкл/выкл стратегии в процессе, повторные клики и
@@ -1309,8 +1384,23 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     sync_timer.timeout.connect(sync_start_btn)
     sync_timer.start(1000)
 
-    tag_timer = QTimer()
-    tag_timer.timeout.connect(_tag_top_windows)
+    _tag_timer = QTimer()
+    globals()["_tag_timer"] = _tag_timer
+
+    def _tag_tick():
+        tagged = _tag_top_windows()
+        if tagged:
+            _tag_idle_passes["n"] = 0
+            return
+        _tag_idle_passes["n"] += 1
+        # 5 пустых проходов (10с) подряд — все видимые окна помечены:
+        # гонять ctypes-обход каждые 2с незачем; при новых окнах таймер
+        # перезапускает _wake_taskbar_tagging (см. вызовы в редакторах/диалогах).
+        if _tag_idle_passes["n"] >= 5:
+            _tag_timer.stop()
+
+    tag_timer = _tag_timer
+    tag_timer.timeout.connect(_tag_tick)
     tag_timer.start(2000)
 
     logging.info("[TRAY] entering event loop")

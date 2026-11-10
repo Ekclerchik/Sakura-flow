@@ -43,14 +43,6 @@ def _set_defaults():
         state.save_state(ipset_mode="any")
 
 try:
-    import tg_ws_proxy 
-except ImportError:
-    try:
-        from src import tg_ws_proxy
-    except ImportError:
-        tg_ws_proxy = None
-
-try:
     import faulthandler
     from pathlib import Path
     import config as _cfg
@@ -65,7 +57,11 @@ except Exception:
 logging.basicConfig(
     filename=config.LOG_FILE,
     filemode="w",
-    level=logging.DEBUG,
+    # INFO по умолчанию: root-logger=DEBUG заставлял форматировать и писать
+    # в файл каждый лог-дебаг прокси (WS pool hit, MsgSplitter passthrough и
+    # т.д.) — при фоновом потреблении это и I/O, и_feature память. Полный
+    # DEBUG включается переменной окружения SAKURA_DEBUG=1.
+    level=logging.DEBUG if os.environ.get("SAKURA_DEBUG") else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     encoding='utf-8'
 )
