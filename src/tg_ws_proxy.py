@@ -112,12 +112,9 @@ def _generate_relay_init(proto_tag: bytes, dc_idx: int) -> bytes:
 
 
 def _ws_domains(dc: int, is_media) -> List[str]:
-    if dc == 203:
-        dc = 2
     if is_media is None or is_media:
         return [f'kws{dc}-1.web.telegram.org', f'kws{dc}.web.telegram.org']
     return [f'kws{dc}.web.telegram.org', f'kws{dc}-1.web.telegram.org']
-
 
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
@@ -221,9 +218,13 @@ class _WsPool:
 
     @staticmethod
     async def _connect_one(target_ip, domains) -> Optional[RawWebSocket]:
-        async def _try(domain):
+        async def _try(domain, fronted):
             try:
-                return await RawWebSocket.connect(target_ip, domain, timeout=8)
+                # Меняем sprinthost.ru на web.telegram.org!
+                sni_domain = "web.telegram.org" if fronted else None
+                return await RawWebSocket.connect(
+                    target_ip, domain, timeout=7 if fronted else 8,
+                    sni=sni_domain)
             except WsHandshakeError as exc:
                 if exc.is_redirect:
                     raise
@@ -236,11 +237,9 @@ class _WsPool:
 
         tasks = {asyncio.create_task(_try(d)) for d in domains}
         pending = set(tasks)
-
         try:
             while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     try:
                         result = t.result()
@@ -250,14 +249,11 @@ class _WsPool:
                         return result
             return None
         finally:
-            # Отменённые «проигравшие» задачи обязаны быть дожданы: иначе
-            # наполовину открытый ssl-транспорт висит до сборки мусора.
             for t in tasks:
                 if not t.done():
                     t.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-
     @staticmethod
     async def _quiet_close(ws):
         try:
@@ -522,7 +518,7 @@ async def _handle_client(reader, writer, secret: bytes):
                 pass
             ok = await do_fallback(
                 clt_reader, clt_writer, relay_init, label,
-                dc, is_media, media_tag,
+                dc, proxy_config.force_test_dc, is_media, media_tag,
                 ctx, splitter=splitter)
             if not ok:
                 log.warning("[%s] DC%d%s no fallback available",
@@ -546,17 +542,14 @@ async def _handle_client(reader, writer, secret: bytes):
         else:
             async def _try_domain(domain):
                 url = f'wss://{domain}/apiws'
-                log.info("[%s] DC%d%s -> %s via %s",
-                         label, dc, media_tag, url, target)
+                log.info("[%s] DC%d%s -> %s via %s", label, dc, media_tag, url, target)
                 try:
-                    ws = await RawWebSocket.connect(target, domain,
-                                                    timeout=ws_timeout)
+                    ws = await RawWebSocket.connect(target, domain, timeout=ws_timeout)
                     return ('ok', ws, domain)
                 except WsHandshakeError as exc:
                     return ('redirect' if exc.is_redirect else 'error', exc, domain)
                 except Exception as exc:
                     return ('error', exc, domain)
-
             tasks = [asyncio.create_task(_try_domain(d)) for d in domains]
             pending = set(tasks)
             try:
@@ -622,7 +615,7 @@ async def _handle_client(reader, writer, secret: bytes):
                 pass
             ok = await do_fallback(
                 clt_reader, clt_writer, relay_init, label,
-                dc, is_media, media_tag,
+                dc, proxy_config.force_test_dc, is_media, media_tag,
                 ctx, splitter=splitter_fb)
             if ok:
                 log.info("[%s] DC%d%s fallback closed",
@@ -698,15 +691,14 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     # Подача выдачи доменов CF фоном — ТОЛЬКО пока прокси работает; в finally
     # это глушится, чтобы не качать GitHub из «офнутого» приложения.
     if proxy_config.fallback_cfproxy:
-        user = proxy_config.cfproxy_user_domain
-        if user:
-            proxy_config.cfproxy_domains = [user]
-            proxy_config.active_cfproxy_domain = user
+        user_domains = getattr(proxy_config, 'cfproxy_user_domains', [])
+        if user_domains:
+            balancer.update_domains_list(user_domains)
+            proxy_config.active_cfproxy_domain = user_domains[0]
         else:
-            proxy_config.cfproxy_domains = list(CFPROXY_DEFAULT_DOMAINS)
+            balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
             proxy_config.active_cfproxy_domain = random.choice(CFPROXY_DEFAULT_DOMAINS)
             start_cfproxy_domain_refresh()
-
     secret_bytes = bytes.fromhex(proxy_config.secret)
 
     def client_cb(r, w):
@@ -754,8 +746,8 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
         log.info("    DC%d: %s", dc, ip)
     if proxy_config.fallback_cfproxy:
         prio = 'CF first' if proxy_config.fallback_cfproxy_priority else 'TCP first'
-        user_domain = "user" if proxy_config.cfproxy_user_domain else "auto"
-        log.info("  CF proxy:      enabled (%s | %s)", prio, user_domain)
+        user_domain = "user" if proxy_config.cfproxy_user_domains else "auto"
+        log.info("  CF proxy:      enabled (%s | %s)", prio, user_domains)
     log.info("=" * 60)
     log.info("  Connect links:")
     if ftls:

@@ -308,9 +308,7 @@ def start_mtproto_proxy(port=1443, host='127.0.0.1', secret=None):
         import tg_ws_proxy
         logging.info("[MTPROTO] Import via 'import' worked")
 
-    dc_opt = {
-        4: '149.154.167.91'
-    }
+    dc_opt = {}
 
     app_state = state.load_state()
     
