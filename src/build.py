@@ -29,6 +29,12 @@ PYINSTALLER_ARGS = [
     "--add-data", "src;src",
     "--icon", "icons/sakura.ico",
     "--version-file", "version.py",
+    "--exclude-module", "numpy",
+    "--exclude-module", "scipy",
+    "--exclude-module", "PIL",
+    "--exclude-module", "pillow",
+    "--exclude-module", "matplotlib",
+    "--exclude-module", "pandas",
     "src/main.py",
 ]
 

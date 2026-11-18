@@ -55,13 +55,17 @@ DROP_FILES = (
     "PyQt5/Qt5/plugins/platforms/qminimal.dll",
     "PyQt5/Qt5/plugins/platforms/qoffscreen.dll",
     "PyQt5/Qt5/plugins/platforms/qwebgl.dll",
-    # --- image formats: keep qico/qjpeg/qgif ---
+    # --- image formats: keep qico (app icons are .png/.ico) ---
     "PyQt5/Qt5/plugins/imageformats/qicns.dll",
     "PyQt5/Qt5/plugins/imageformats/qsvg.dll",   # needs Qt5Svg
     "PyQt5/Qt5/plugins/imageformats/qtga.dll",
     "PyQt5/Qt5/plugins/imageformats/qtiff.dll",
     "PyQt5/Qt5/plugins/imageformats/qwbmp.dll",
     "PyQt5/Qt5/plugins/imageformats/qwebp.dll",
+    "PyQt5/Qt5/plugins/imageformats/qjpeg.dll",
+    "PyQt5/Qt5/plugins/imageformats/qgif.dll",
+    # --- unused Qt style plugin ---
+    "PyQt5/Qt5/plugins/styles/qwindowsvistastyle.dll",
     # --- duplicates of zapret/bin/* ---
     "cygwin1.dll",
     "WinDivert.dll",
@@ -76,6 +80,13 @@ DROP_DIRS = (
     "PyQt5/Qt5/plugins/platformthemes",    # only for GTK/KDE on Linux
     "PyQt5/Qt5/plugins/iconengines",       # qsvgicon -> needs Qt5Svg
     "pythonwin",                            # pywin32 IDE, not imported
+    # --- not used by the app; can be pulled in by environment hooks ---
+    "numpy",
+    "numpy.libs",
+    "PIL",
+    "scipy",
+    "matplotlib",
+    "pandas",
 )
 
 
@@ -164,7 +175,12 @@ def main() -> int:
                     except OSError:
                         pass
 
-    for rel in (*DROP_FILES, *DROP_DIRS):
+    drop_paths = [*DROP_FILES, *DROP_DIRS]
+    # Package metadata SBOMs are not needed at runtime (e.g. cryptography dist-info)
+    for sbom_dir in INTERNAL.glob("*.dist-info/sboms"):
+        drop_paths.append(str(sbom_dir.relative_to(INTERNAL)).replace("\\", "/"))
+
+    for rel in drop_paths:
         path = INTERNAL / rel
         if not path.exists():
             continue
@@ -181,8 +197,8 @@ def main() -> int:
         print(f"{action}: {rel} ({size / 1048576:.2f} MB)")
 
     if args.dry_run:
-        freed = sum(_size(INTERNAL / rel) for rel in (*DROP_FILES, *DROP_DIRS) if (INTERNAL / rel).exists())
-        removed = sum(1 for rel in (*DROP_FILES, *DROP_DIRS) if (INTERNAL / rel).exists())
+        freed = sum(_size(INTERNAL / rel) for rel in drop_paths if (INTERNAL / rel).exists())
+        removed = sum(1 for rel in drop_paths if (INTERNAL / rel).exists())
     else:
         for rel in RELOCATE:
             src = INTERNAL / rel
