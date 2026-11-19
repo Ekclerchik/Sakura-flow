@@ -340,7 +340,7 @@ class H2Transport(httpx.AsyncBaseTransport):
                 writer = None
                 try:
                     target_sni = self.sni or origin[0]
-                    connect_ip = "162.159.1.1" if origin[0].endswith(".co.uk") else origin[0]
+                    connect_ip = origin[0]
                     reader, writer = await asyncio.wait_for(asyncio.open_connection(
                         connect_ip, origin[1], ssl=self.ssl_context, server_hostname=target_sni),
                         timeouts.get('connect'))

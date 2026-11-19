@@ -380,7 +380,7 @@ class _CfWorkerPool:
             try:
                 ws = await RawWebSocket.connect(
                     worker_domain, worker_domain, timeout=8, path=path,
-                    secure=not proxy_config.disable_secure)
+                    secure=False)
                 return ws, worker_domain
             except Exception as exc:
                 log.debug("CF worker pool connect DC%d via %s for %s failed: %r",

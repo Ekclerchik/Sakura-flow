@@ -112,7 +112,7 @@ class RawWebSocket:
         if sni == "sprinthost.ru":
             ctx = _ssl_ctx_fronting
         try:
-            connect_ip = "188.114.96.1" if host.endswith(".co.uk") else host
+            connect_ip = host
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(connect_ip, port, ssl=ctx, server_hostname=sni if secure else None),
                 timeout=min(timeout, 10))
@@ -188,7 +188,9 @@ class RawWebSocket:
             else:
                 self.writer.write(_st_BBQ4s.pack(fb, 0x80 | 127, length, mask_key))
             self.writer.write(_xor_mask(data, mask_key))
-        await self._drain_if_needed()
+        # Дреним сразу, чтобы мелкие/редкие аплоады (например фото) не залипали
+        # в буфере сокета в ожидании high-water mark.
+        await self.writer.drain()
 
     async def send_batch(self, parts: List[bytes]):
         if self._closed:

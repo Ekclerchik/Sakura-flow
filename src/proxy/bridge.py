@@ -213,8 +213,8 @@ async def _cfproxy_worker_fallback(reader, writer, relay_init, label,
 
             try:
                 ws = await RawWebSocket.connect(worker_domain, worker_domain,
-                                                timeout=10.0, path=path, 
-                                                secure=not proxy_config.disable_secure)
+                                                timeout=10.0, path=path,
+                                                secure=False)
                 break
             except Exception as exc:
                 cf_worker_pool.report_failure(worker_domain, exc)
@@ -244,18 +244,17 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
     log.info("[%s] DC%d%s -> trying CF proxy",
             label, dc, media_tag)
     connect_started = time.monotonic()
-    secure = not proxy_config.disable_secure
 
     for base_domain in balancer.get_domains_for_dc(dc):
         ws_dc = 2 if dc == 203 else dc  # <--- ДОБАВЛЯЕМ ЭТУ СТРОКУ
         domain = f'kws{ws_dc}.{base_domain}' # <--- ИСПОЛЬЗУЕМ ws_dc
         try:
-            ws = await RawWebSocket.connect(domain, domain, timeout=10.0, secure=secure, sni=base_domain)
+            ws = await RawWebSocket.connect(domain, domain, timeout=10.0, secure=False)
             chosen_domain = base_domain
             break
         except Exception as exc:
             log.warning("[%s] DC%d%s CF proxy failed: %r (host=%s port=%d)",
-                        label, dc, media_tag, exc, domain, 443 if secure else 80)
+                        label, dc, media_tag, exc, domain, 80)
 
     if ws is None:
         return False
