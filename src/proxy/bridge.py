@@ -245,16 +245,49 @@ async def _cfproxy_fallback(reader, writer, relay_init, label,
             label, dc, media_tag)
     connect_started = time.monotonic()
 
-    for base_domain in balancer.get_domains_for_dc(dc):
-        ws_dc = 2 if dc == 203 else dc  # <--- ДОБАВЛЯЕМ ЭТУ СТРОКУ
-        domain = f'kws{ws_dc}.{base_domain}' # <--- ИСПОЛЬЗУЕМ ws_dc
+    candidates = list(balancer.get_domains_for_dc(dc))
+
+    async def _try_one(base_domain: str):
+        ws_dc = 2 if dc == 203 else dc
+        domain = f'kws{ws_dc}.{base_domain}'
         try:
-            ws = await RawWebSocket.connect(domain, domain, timeout=10.0, secure=False)
-            chosen_domain = base_domain
-            break
+            cws = await RawWebSocket.connect(domain, domain, timeout=6.0, secure=False)
+            return ('ok', cws, base_domain)
         except Exception as exc:
-            log.warning("[%s] DC%d%s CF proxy failed: %r (host=%s port=%d)",
-                        label, dc, media_tag, exc, domain, 80)
+            return ('err', exc, base_domain)
+
+    # Пробуем домены волнами по 3: берём первый успешный, чтобы не ждать
+    # последовательные таймауты на плохих кандидатах.
+    for i in range(0, len(candidates), 3):
+        batch = candidates[i:i + 3]
+        tasks = [asyncio.create_task(_try_one(d)) for d in batch]
+        pending = set(tasks)
+        try:
+            while pending and ws is None:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        status, result, base_domain = t.result()
+                    except Exception as exc:
+                        log.warning("[%s] DC%d%s CF proxy task failed: %r",
+                                    label, dc, media_tag, exc)
+                        continue
+                    if status == 'ok':
+                        ws = result
+                        chosen_domain = base_domain
+                        break
+                    ws_dc = 2 if dc == 203 else dc
+                    domain = f'kws{ws_dc}.{base_domain}'
+                    log.warning("[%s] DC%d%s CF proxy failed: %r (host=%s port=%d)",
+                                label, dc, media_tag, result, domain, 80)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if ws is not None:
+            break
 
     if ws is None:
         return False
