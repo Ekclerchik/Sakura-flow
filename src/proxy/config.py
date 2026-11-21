@@ -163,27 +163,8 @@ def _normalize_domain_pool(domains: List[str]) -> List[str]:
 
 
 def refresh_cfproxy_domains() -> None:
-    if proxy_config.cfproxy_user_domains:
-        return
-
-    fetched = _fetch_cfproxy_domain_list()
-    pool = _normalize_domain_pool(fetched)
-    if len(pool) >= _CFPROXY_MIN_VALID_DOMAINS:
-        balancer.update_domains_list(pool)
-        log.info("CF proxy domain pool updated from GitHub (%d domains)", len(pool))
-        return
-
-    if fetched:
-        log.warning(
-            "Ignoring fetched CF proxy domains due to low-quality payload "
-            "(total=%d, valid=%d, required>=%d); keeping current domain pool",
-            len(fetched), len(pool), _CFPROXY_MIN_VALID_DOMAINS,
-        )
-    else:
-        log.warning(
-            "CF proxy domain refresh failed or empty response; "
-            "keeping current domain pool",
-        )
+    """Обновление CF proxy доменов из GitHub отключено: используем только встроенный список."""
+    return
 
 
 _refresh_stop: threading.Event = threading.Event()
@@ -193,16 +174,10 @@ def start_cfproxy_domain_refresh() -> None:
     global _refresh_stop
     _refresh_stop.set()
     _refresh_stop = threading.Event()
-    stop = _refresh_stop
 
     balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
-
-    def _loop():
-        refresh_cfproxy_domains()
-        while not stop.wait(timeout=3600):
-            refresh_cfproxy_domains()
-
-    threading.Thread(target=_loop, daemon=True, name='cfproxy-domains-refresh').start()
+    log.info("CF proxy domains: using built-in list (%d domains), GitHub refresh disabled",
+             len(CFPROXY_DEFAULT_DOMAINS))
 
 
 def shutdown_cfproxy_domain_refresh() -> None:
