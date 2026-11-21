@@ -20,7 +20,7 @@
 - Для запуска из исходного кода: Python 3.10+
 
 ###  Как запустить
-1. Скачайте SakuraFlow.zip из раздела [Releases](https://github.com/Ekcler/Sakura-flow/releases)
+1. Скачайте SakuraFlow.zip из раздела [Releases](https://github.com/Ekclerchik/Sakura-flow/releases)
 2. Распакуйте zip в удобную папку
 3. Откройте Sakuraflow.exe
 4. Прочитайте инструкцию
