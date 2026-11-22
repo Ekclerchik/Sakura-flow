@@ -162,6 +162,14 @@ class ListEditorWindow(QWidget):
         cancel_btn.clicked.connect(self.close)
         QShortcut(QKeySequence("Ctrl+S"), self, self.save_data)
 
+        # Пересчёт статистики по всему тексту (splitlines + 2 setText) на КАЖДОЙ
+        # клавише — заметный лаг на большом блоклисте. Откладываем его на 120 мс
+        # после последней правки; флаг *_dirty/заголовок обновляем сразу.
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setSingleShot(True)
+        self._stats_timer.setInterval(120)
+        self._stats_timer.timeout.connect(self._update_stats)
+
         self._load()
 
     def _load(self):
@@ -171,13 +179,15 @@ class ListEditorWindow(QWidget):
             self._original = tools.read_ignore_list()
         self.text_edit.setPlainText(self._original)
         self._dirty = False
+        self._stats_timer.stop()
         self._update_stats()
         self._update_title()
 
     def _on_text_changed(self):
+        # Один toPlainText() вместо трёх (раньше ещё 2 внутри _update_stats).
         self._dirty = self.text_edit.toPlainText() != self._original
-        self._update_stats()
         self._update_title()
+        self._stats_timer.start()  # тяжёлый подсчёт — после паузы в наборе
 
     def _update_stats(self):
         entries = 0
@@ -193,7 +203,9 @@ class ListEditorWindow(QWidget):
         self.count_lbl.setText(f"{domains} domains")
 
     def _update_title(self):
-        self.setWindowTitle(self._base_title + (" *" if self._dirty else ""))
+        title = self._base_title + (" *" if self._dirty else "")
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
 
     def sort_dedupe(self):
         seen = set()
@@ -326,10 +338,13 @@ class NetworkToolsWindow(QWidget):
         state.save_state(ipv6_enabled=self._ipv6_on)
         self.init_ui()
         
-        app_state = state.load_state()
+        # Переиспользуем уже прочитанный state: лишняя read+json на старте
+        # окна не нужна, как и два разных generate_secret() для placeholder/text.
+        app_state = _saved
         self.tg_port_input.setText(str(app_state.get("mtproto_port", 1443)))
         self.tg_host_input.setText(app_state.get("mtproto_host", "127.0.0.1"))
         secret_init = app_state.get("mtproto_secret") or tools.generate_secret()
+        self.tg_secret_input.setPlaceholderText(secret_init)
         self.tg_secret_input.setText(secret_init)
         
         if app_state.get("mtproto_enabled", False):
@@ -384,14 +399,61 @@ class NetworkToolsWindow(QWidget):
         и после многих запусков кнопки процесс «раздувается» (20 -> 36 МБ и выше)."""
         doc = self.log_area.document()
         try:
-            while doc.blockCount() > self._MAX_LOG_BLOCKS:
-                first = doc.begin()
-                cur = self.log_area.textCursor()
-                cur.setPosition(first.position())
-                cur.setPosition(first.next().position(), cur.KeepAnchor)
-                cur.removeSelectedText()
+            excess = doc.blockCount() - self._MAX_LOG_BLOCKS
+            if excess <= 0:
+                return
+            # Раньше удаляли по одному блоку за вызов — при пачке логов это
+            # десятки перерисовок QTextDocument. Удаляем все лишние блоки сразу.
+            cur = self.log_area.textCursor()
+            cur.setPosition(doc.begin().position())
+            cur.setPosition(doc.findBlockByNumber(excess).position(),
+                            cur.KeepAnchor)
+            cur.removeSelectedText()
         except Exception as e:
-            logging.error(f"[spinner] trim: {e}")
+            logging.error(f"[log] trim: {e}")
+
+    def _run_bg(self, work, done):
+        """Выполнить тяжёлую операцию (netsh/reg/файл) в фоне, а результат
+        вернуть в GUI-поток через мост. Формат: done(result, error)."""
+        def _task():
+            result = None
+            error = None
+            try:
+                result = work()
+            except Exception as e:
+                logging.error(f"[tools] bg task: {e}")
+                error = e
+
+            def _apply():
+                done(result, error)
+
+            QMetaObject.invokeMethod(self._bridge, "_run",
+                                     Qt.QueuedConnection,
+                                     Q_ARG(object, _apply))
+
+        threading.Thread(target=_task, daemon=True).start()
+
+    def _schedule_ipv6_sync(self):
+        """Проверка/авто-откат IPv6 может дёрнуть reg + netsh на каждом
+        интерфейсе — запускаем в фоне, в GUI только флаги и логи."""
+        if getattr(self, "_ipv6_sync_busy", False):
+            return
+        self._ipv6_sync_busy = True
+
+        def _task():
+            try:
+                self._sync_ipv6_btn()
+            except Exception as e:
+                logging.error(f"[ipv6] sync: {e}")
+            finally:
+                def _apply():
+                    self._ipv6_sync_busy = False
+
+                QMetaObject.invokeMethod(self._bridge, "_run",
+                                         Qt.QueuedConnection,
+                                         Q_ARG(object, _apply))
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def init_ui(self):
         self.setWindowTitle("Sakura Flow")
@@ -574,41 +636,47 @@ class NetworkToolsWindow(QWidget):
 
     def toggle_ipv6(self):
         new_state = not self._ipv6_on
-        if new_state:
-            ok = tools.enable_ipv6()
-            self.log_append("IPv6 enabled")
-            for name in tools.get_ipv6_interface_names():
-                tools.set_ipv6_interface(name, True)
-        else:
-            ok = tools.disable_ipv6()
-            self.log_append("IPv6 disabled")
+        self.ipv6_toggle_btn.setEnabled(False)
+
+        def _work():
+            if new_state:
+                ok = tools.enable_ipv6()
+            else:
+                ok = tools.disable_ipv6()
             # реестра (DisabledComponents) мало: он действует только после
             # перезагрузки, а интерфейсы продолжают работать, затем _sync_ipv6_btn
-            # считает это «самовключением». Отключаем интерфейсы netsh сразу —
-            # как это делает скрытая автонастройка.
+            # считает это «самовключением». Дёргаем netsh в фоне — по числу
+            # интерфейсов это десятки subprocess-вызовов, в GUI они морозили окно.
             for name in tools.get_ipv6_interface_names():
-                tools.set_ipv6_interface(name, False)
-        if not ok:
-            self.log_append("IPv6: не удалось изменить (нужны права администратора)", "red")
-            return
-        self._ipv6_on = new_state
-        state.save_state(ipv6_enabled=self._ipv6_on,
-                         ipv6_user_disabled=not self._ipv6_on)
-        self._ipv6_reapplied = False
-        self._ipv6_sync_warned = False
-        if self._ipv6_on:
-            self.ipv6_toggle_btn.setText("Turn OFF")
-            self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
-            """)
-        else:
-            self.ipv6_toggle_btn.setText("Turn ON")
-            self.ipv6_toggle_btn.setStyleSheet("""
-                QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
-                QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
-            """)
-        self.log_append("Restart required for changes to take effect")
+                tools.set_ipv6_interface(name, new_state)
+            return ok
+
+        def _done(ok, err):
+            self.ipv6_toggle_btn.setEnabled(True)
+            if err is not None or not ok:
+                self.log_append("IPv6: не удалось изменить (нужны права администратора)", "red")
+                return
+            self.log_append("IPv6 enabled" if new_state else "IPv6 disabled")
+            self._ipv6_on = new_state
+            state.save_state(ipv6_enabled=self._ipv6_on,
+                             ipv6_user_disabled=not self._ipv6_on)
+            self._ipv6_reapplied = False
+            self._ipv6_sync_warned = False
+            if self._ipv6_on:
+                self.ipv6_toggle_btn.setText("Turn OFF")
+                self.ipv6_toggle_btn.setStyleSheet("""
+                    QPushButton { background-color: rgba(180, 60, 80, 0.4); border: 1px solid rgba(255, 85, 85, 0.4); color: #ff6b6b; font-weight: bold; padding: 10px; border-radius: 4px; }
+                    QPushButton:hover { background-color: rgba(255, 77, 136, 0.3); border: 1px solid #ff4d88; }
+                """)
+            else:
+                self.ipv6_toggle_btn.setText("Turn ON")
+                self.ipv6_toggle_btn.setStyleSheet("""
+                    QPushButton { background-color: rgba(45, 80, 60, 0.5); border: 1px solid rgba(123, 237, 159, 0.4); color: #7bed9f; font-weight: bold; padding: 10px; border-radius: 4px; }
+                    QPushButton:hover { background-color: rgba(46, 213, 115, 0.25); border: 1px solid #2ed573; }
+                """)
+            self.log_append("Restart required for changes to take effect")
+
+        self._run_bg(_work, _done)
 
     def _get_game_filter_label(self):
         mode = tools.get_game_filter_mode()
@@ -671,8 +739,15 @@ class NetworkToolsWindow(QWidget):
             except Exception as e:
                 self.log_append(f"ERROR: {e}", "red")
             finally:
+                # tcp-проба порта (до 0.5с на адрес) раньше шла в GUI-потоке
+                # внутри _finalize_mtproto — считаем её здесь, в воркере.
+                try:
+                    final_running = tools.is_mtproto_proxy_running(port=port, host=host)
+                except Exception:
+                    final_running = False
                 QMetaObject.invokeMethod(self, "_finalize_mtproto",
-                                         Qt.QueuedConnection)
+                                         Qt.QueuedConnection,
+                                         Q_ARG(bool, final_running))
         threading.Thread(target=_task, daemon=True).start()
 
     @pyqtSlot(str)
@@ -709,8 +784,13 @@ class NetworkToolsWindow(QWidget):
                 except Exception as e:
                     self.log_append(f"ERROR: {e}", "red")
                 finally:
+                    try:
+                        final_running = tools.is_mtproto_proxy_running(port=port, host=host)
+                    except Exception:
+                        final_running = False
                     QMetaObject.invokeMethod(self, "_finalize_mtproto",
-                                             Qt.QueuedConnection)
+                                             Qt.QueuedConnection,
+                                             Q_ARG(bool, final_running))
             threading.Thread(target=do_stop, daemon=True).start()
         else:
             self.log_append("Starting MTPROTO proxy...")
@@ -730,22 +810,21 @@ class NetworkToolsWindow(QWidget):
                 except Exception as e:
                     self.log_append(f"ERROR: {e}", "red")
                 finally:
+                    try:
+                        final_running = tools.is_mtproto_proxy_running(port=port, host=host)
+                    except Exception:
+                        final_running = False
                     QMetaObject.invokeMethod(self, "_finalize_mtproto",
-                                             Qt.QueuedConnection)
+                                             Qt.QueuedConnection,
+                                             Q_ARG(bool, final_running))
             threading.Thread(target=do_start, daemon=True).start()
 
-    @pyqtSlot()
-    def _finalize_mtproto(self):
-        """Разблокирует кнопку прокси после вкл/выкл и возвращает ей текст по
-        фактическому состоянию (а не по тому, что надеялись сделать)."""
+    @pyqtSlot(bool)
+    def _finalize_mtproto(self, running):
+        """Разблокирует кнопку прокси после вкл/выкл. tcp-проба уже сделана
+        рабочим потоком: в GUI больше не ждём socket.connect с таймаутом."""
         self._mtproto_busy = False
         self.mtproto_toggle_btn.setEnabled(True)
-        try:
-            port = int(self.tg_port_input.text().strip() or "1443")
-            host = self.tg_host_input.text().strip() or "127.0.0.1"
-            running = tools.is_mtproto_proxy_running(port=port, host=host)
-        except Exception:
-            running = False
         if running:
             self.mtproto_toggle_btn.setText("STOP")
             self.mtproto_toggle_btn.setStyleSheet(self._MTPROTO_STOP_STYLE)
@@ -825,7 +904,7 @@ class NetworkToolsWindow(QWidget):
         # Окно открыли — сразу приводим кнопку IPv6 к реальному состоянию:
         # пока окно было скрыто, _sync_ipv6_btn не вызывался (см. update_stats).
         self._ipv6_check_accum = 0
-        self._sync_ipv6_btn()
+        self._schedule_ipv6_sync()
         # Скрытый период копили 5с-дельту: обновим базу _last_io молча, чтобы
         # первый показ не показал гигантскую «шпильку» KB/s за 5с.
         try:
@@ -836,16 +915,17 @@ class NetworkToolsWindow(QWidget):
 
     def update_stats(self):
         up, down = tools.get_traffic_stats()
-        self.traffic_label.setText(f"TRAFFIC | UP: {up} KB/s | DOWN: {down} KB/s")
-        # netsh-проверка IPv6 — тяжёлый subprocess; в скрытом окне она не нужна
-        # (кнопки не видно). Трафик считаем всегда: он дешёвый (~2мс) и держит
-        # непрерывность счётчика между открытиями (см. пояснение в closeEvent).
+        text = f"TRAFFIC | UP: {up} KB/s | DOWN: {down} KB/s"
+        if self.traffic_label.text() != text:
+            self.traffic_label.setText(text)
+        # psutil.net_if_stats/addrs в _sync_ipv6_btn (и возможный netsh-откат)
+        # ушли в фон; в GUI остался только дешёвый счётчик трафика.
         if not self.isVisible():
             return
         self._ipv6_check_accum = getattr(self, "_ipv6_check_accum", 0) + 1
         if self._ipv6_check_accum >= 30:
             self._ipv6_check_accum = 0
-            self._sync_ipv6_btn()
+            self._schedule_ipv6_sync()
 
     def _sync_ipv6_btn(self):
         """Keep the IPv6 toggle in sync with the REAL system state (button must not lie)."""
@@ -925,14 +1005,30 @@ class NetworkToolsWindow(QWidget):
         threading.Thread(target=_work, daemon=True).start()
 
     def apply_best_dns(self):
-        if self.best_dns_found:
-            s, i = tools.set_system_dns(self.best_dns_found)
+        best = self.best_dns_found
+        if not best:
+            return
+        # set_system_dns = 1-2 вызова netsh (~100-300 мс каждый): в GUI-потоке
+        # окно замирало. Кнопку гасим на время работы, результат пишем в лог.
+        self.apply_dns_btn.setEnabled(False)
+
+        def _done(res, err):
+            s, i = res if res else (False, str(err))
             self.log_area.append(f"DNS Set: {s} ({i})")
             self.apply_dns_btn.hide()
+            self.apply_dns_btn.setEnabled(True)
+
+        self._run_bg(lambda: tools.set_system_dns(best), _done)
 
     def run_reset_dns(self):
-        s, i = tools.reset_system_dns()
-        self.log_area.append(f"DNS Reset: {s} ({i})")
+        self.reset_dns_btn.setEnabled(False)
+
+        def _done(res, err):
+            s, i = res if res else (False, str(err))
+            self.log_area.append(f"DNS Reset: {s} ({i})")
+            self.reset_dns_btn.setEnabled(True)
+
+        self._run_bg(tools.reset_system_dns, _done)
 
 
 tools_window = None
@@ -1179,14 +1275,20 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     # воркер будит его через QMetaObject.invokeMethod(_bridge, "_run") (queued в
     # event loop GUI-потока, thread-safe), sync-таймер — фолбэк, если иначе не дошло.
     _bridge = _GuiBridge()
-    _strategy_busy = {"on": False, "done": False}
+    _strategy_busy = {"on": False, "done": False, "running": False}
+    # Единственный запусковый вызов is_winws_running() в GUI; дальше состояние
+    # обновляется фоновым пробингом, а 1-секундный таймер только читает кэш.
+    _winws_cached = {"v": tools.is_winws_running()}
+    _probe_busy = {"v": False}
 
-    def _finish():
+    def _finish(running):
         _strategy_busy["on"] = False
         _strategy_busy["done"] = False
-        # состояние берём по факту после операции, а не по оптимистичному
-        # предположению (успешный start_service не обязан дать RUNNING сразу)
-        update_start_btn(start_btn, tools.is_winws_running())
+        # состояние уже проверено рабочим потоком: в GUI больше не дёргаем
+        # psutil.process_iter / tasklist (это давало тиковый микрофриз).
+        _winws_cached["v"] = running
+        start_btn.setEnabled(True)
+        update_start_btn(start_btn, running)
 
     def _notify_start_failure():
         """Показать пользователю причину, почему winws не поднялся (а не только
@@ -1196,11 +1298,26 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         except Exception as e:
             detail = f"Не удалось собрать диагностику: {e}"
         logging.error(f"[toggle_strategy] winws не запустился:\n{detail}")
-        try:
-            tray.showMessage("Sakura Flow — winws не запустился", detail,
-                             QSystemTrayIcon.Warning, 12000)
-        except Exception:
-            pass
+        # Этот метод зовётся из воркера: showMessage — GUI-API, поэтому
+        # показываем уведомление через тот же queued-мост.
+        def _show():
+            try:
+                tray.showMessage("Sakura Flow — winws не запустился", detail,
+                                 QSystemTrayIcon.Warning, 12000)
+            except Exception:
+                pass
+
+        QMetaObject.invokeMethod(_bridge, "_run", Qt.QueuedConnection,
+                                 Q_ARG(object, _show))
+
+    def _set_start_btn_pending(btn, starting):
+        """Мгновенная реакция на клик, не дожидаясь работы службы.
+        Иконку ставим заглушку (не «чек»), чтобы меню не показывало Stop,
+        пока winws реально не поднялся. 16x16-заглушка не двигает текст."""
+        ph, _ = _start_menu_icons()
+        btn.setIcon(ph)
+        btn.setText("  ⏳ Starting..." if starting else "  ⏳ Stopping...")
+        btn.setEnabled(False)
 
     def toggle_strategy(btn):
         """Toggle strategy on/off. All slow work (service start/stop) runs in
@@ -1209,34 +1326,40 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         cross-thread (pyqtSlot исполняется в event loop GUI-потока).
 
         start/stop теперь БЫСТРЫЕ (см. ИНВАРИАНТ 4 в service.py). Не добавлять в
-        do_start/do_stop длинные ожидания: пока идёт стоп, кнопка «залипает»
-        (была жалоба «стоп не нажимается»)."""
+        _work длинные ожидания: пока идёт стоп, кнопка «залипает» (была жалоба
+        «стоп не нажимается»)."""
         if _strategy_busy["on"]:
             return
-        running = tools.is_winws_running()
+        # Берём направление из кэша фонового пробинга: решение о pending-тексте
+        # принимается в GUI-потоке МГНОВЕННО, без is_winws_running() в клике.
+        starting = not _winws_cached["v"]
         _strategy_busy["on"] = True
         _strategy_busy["done"] = False
+        _set_start_btn_pending(btn, starting)
 
-        def _notify_done():
+        def _notify_done(running):
             _strategy_busy["done"] = True
+            _strategy_busy["running"] = running
+
+            def _apply():
+                _finish(running)
+
             QMetaObject.invokeMethod(_bridge, "_run",
                                      Qt.QueuedConnection,
-                                     Q_ARG(object, _finish))
+                                     Q_ARG(object, _apply))
 
-        if running:
-            def do_stop():
-                try:
+        def _work():
+            # Направление уже выбрано по кэшу в клике. Повторная проверка
+            # is_winws_running() здесь только добавляла ~40мс (tasklist) перед
+            # стартом; start_service сам проверит _already_running и не
+            # пересоздаст службу зря.
+            was_running = not starting
+            try:
+                if was_running:
                     # stop_service теперь сама удаляет службу и ждёт полного стопа
                     service.stop_service()
                     state.save_state(last_bat=None, stopped=True)
-                except Exception as e:
-                    logging.error(f"[toggle_strategy] Stop error: {e}")
-                finally:
-                    _notify_done()
-            threading.Thread(target=do_stop, daemon=True).start()
-        else:
-            def do_start():
-                try:
+                else:
                     app_state = state.load_state()
                     last_bat = app_state.get("last_bat")
                     bat_path = tools.pick_strategy_bat(bat_files, last_bat)
@@ -1247,12 +1370,20 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                         state.save_state(last_bat=bat_path.stem, stopped=False)
                         if not service.start_service(bat_path, bat_path.stem):
                             _notify_start_failure()
-                except Exception as e:
-                    logging.error(f"[toggle_strategy] Start error: {e}")
+            except Exception as e:
+                logging.error(f"[toggle_strategy] {'Stop' if was_running else 'Start'} error: {e}")
+                if not was_running:
                     _notify_start_failure()
-                finally:
-                    _notify_done()
-            threading.Thread(target=do_start, daemon=True).start()
+            finally:
+                # успешный start_service не обязан сразу дать RUNNING — берём
+                # факт уже здесь, в воркере, и отдаём готовое значение в GUI.
+                try:
+                    final_running = tools.is_winws_running()
+                except Exception:
+                    final_running = False
+                _notify_done(final_running)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def update_start_btn(btn, running, force=False):
         """Update Start button based on winws running state. Обновляется сразу,
@@ -1269,7 +1400,7 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         btn.setText(new_text)
 
     start_btn = QAction("  ⚡ Start", menu)
-    update_start_btn(start_btn, tools.is_winws_running(), force=True)
+    update_start_btn(start_btn, _winws_cached["v"], force=True)
     start_btn.triggered.connect(lambda: toggle_strategy(start_btn))
     menu.addAction(start_btn)
     menu.addAction("  🌐 Internet Settings", lambda: subprocess.Popen("control ncpa.cpl", shell=True, creationflags=0x08000000))
@@ -1278,8 +1409,48 @@ def create_tray_app(bat_files, register_sleep_handler=None):
 
     autostart_action = menu.addAction("  🔄 Autostart")
     autostart_action.setCheckable(True)
-    autostart_action.setChecked(autostart.is_autostart_enabled())
-    autostart_action.toggled.connect(lambda chk: autostart.enable_autostart() if chk else autostart.disable_autostart())
+    autostart_action.setChecked(False)
+    _autostart_user_set = {"v": False}
+
+    def _set_autostart(enabled):
+        # win32com + Планировщик задач — тяжёлый вызов; из GUI-слота он
+        # замораживал меню, поэтому и чтение, и запись уходят в фон.
+        def _work():
+            try:
+                if enabled:
+                    autostart.enable_autostart()
+                else:
+                    autostart.disable_autostart()
+            except Exception as e:
+                logging.error(f"[autostart] toggle: {e}")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _apply_autostart_state(enabled):
+        if _autostart_user_set["v"]:
+            return
+        autostart_action.blockSignals(True)
+        autostart_action.setChecked(enabled)
+        autostart_action.blockSignals(False)
+
+    def _check_autostart():
+        try:
+            enabled = autostart.is_autostart_enabled()
+        except Exception:
+            enabled = False
+
+        def _apply():
+            _apply_autostart_state(enabled)
+
+        QMetaObject.invokeMethod(_bridge, "_run", Qt.QueuedConnection,
+                                 Q_ARG(object, _apply))
+
+    def _on_autostart_toggled(chk):
+        _autostart_user_set["v"] = True
+        _set_autostart(chk)
+
+    autostart_action.toggled.connect(_on_autostart_toggled)
+    threading.Thread(target=_check_autostart, daemon=True).start()
 
     menu.addSeparator()
 
@@ -1360,14 +1531,8 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     # «сам вырубился». Меняем на Off только после 3 тиков подряд без процесса.
     _absent_ticks = {"n": 0}
 
-    def sync_start_btn():
-        # рабочий поток завершился -> финализируем ТОЛЬКО тут, в GUI-потоке
-        if _strategy_busy["on"] and _strategy_busy["done"]:
-            _finish()
-        if _strategy_busy["on"]:
-            _absent_ticks["n"] = 0
-            return
-        running = tools.is_winws_running()
+    def _apply_winws_state(running):
+        _winws_cached["v"] = running
         if running:
             _absent_ticks["n"] = 0
         else:
@@ -1375,6 +1540,41 @@ def create_tray_app(bat_files, register_sleep_handler=None):
             if _absent_ticks["n"] < 3:
                 return
         update_start_btn(start_btn, running)
+
+    def _probe_winws_async():
+        # psutil.process_iter + tasklist (раз в 5с) ran в GUI-потоке каждые
+        # 1000 мс — источник регулярных микрофризов. Опрос уходит в фон,
+        # результат возвращается через тот же мост, что и Start/Stop.
+        if _probe_busy["v"]:
+            return
+        _probe_busy["v"] = True
+
+        def _work():
+            try:
+                running = tools.is_winws_running()
+            except Exception:
+                running = False
+
+            def _apply():
+                _probe_busy["v"] = False
+                if _strategy_busy["on"]:
+                    return  # пока идёт Start/Stop, кнопку не трогаем
+                _apply_winws_state(running)
+
+            QMetaObject.invokeMethod(_bridge, "_run",
+                                     Qt.QueuedConnection,
+                                     Q_ARG(object, _apply))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def sync_start_btn():
+        # рабочий поток завершился -> финализируем ТОЛЬКО тут, в GUI-потоке
+        if _strategy_busy["on"] and _strategy_busy["done"]:
+            _finish(_strategy_busy["running"])
+        if _strategy_busy["on"]:
+            _absent_ticks["n"] = 0
+            return
+        _probe_winws_async()
 
     # как только меню трея закрывается — сразу свежее состояние кнопки,
     # а не через ждать следующий тик (1с)

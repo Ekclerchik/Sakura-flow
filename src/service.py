@@ -507,7 +507,14 @@ def _stop_locked():
         logging.info("Остановка SakuraFlowService...")
         run_cmd(f'sc.exe stop "{SERVICE_NAME}"', timeout=30)
         _wait_service_stopped()
-        run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
+        # Даём winws коротко выйти самому и освободить WinDivert/WFP-фильтры.
+        # Безусловный taskkill /F сразу после STOPPED может оборвать очистку
+        # фильтров и оставить FWP_E_IN_USE (0x8032000A) до перезагрузки.
+        deadline = time.time() + 1.0
+        while _winws_running() and time.time() < deadline:
+            time.sleep(0.2)
+        if _winws_running():
+            run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
         # Удаляем службу (create_service создаёт её с delayed-auto): иначе после
         # Stop/Exit Windows всё равно поднимет winws через пару минут после
         # загрузки ПК. Это же обязательно перед следующим стартом — sc create не
