@@ -1,3 +1,4 @@
+certifi
 cryptography
 h2
 httpx
