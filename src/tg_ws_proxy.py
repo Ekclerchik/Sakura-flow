@@ -27,7 +27,7 @@ if __name__ == '__main__' and (__package__ is None or __package__ == ''):
 try:
     from src.proxy.utils import *
     from src.proxy.stats import stats
-    from src.proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, shutdown_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
+    from src.proxy.config import proxy_config, parse_dc_ip_list, CFPROXY_DEFAULT_DOMAINS
     from src.proxy.bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
     from src.proxy.raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
     from src.proxy.fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
@@ -35,7 +35,7 @@ try:
 except ImportError:
     from proxy.utils import *
     from proxy.stats import stats
-    from proxy.config import proxy_config, parse_dc_ip_list, start_cfproxy_domain_refresh, shutdown_cfproxy_domain_refresh, CFPROXY_DEFAULT_DOMAINS
+    from proxy.config import proxy_config, parse_dc_ip_list, CFPROXY_DEFAULT_DOMAINS
     from proxy.bridge import MsgSplitter, CryptoCtx, do_fallback, bridge_ws_reencrypt
     from proxy.raw_websocket import RawWebSocket, WsHandshakeError, set_sock_opts
     from proxy.fake_tls import proxy_to_masking_domain, verify_client_hello, build_server_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE
@@ -688,8 +688,7 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
     dc_fail_until.clear()
     _client_tasks.clear()
 
-    # Подача выдачи доменов CF фоном — ТОЛЬКО пока прокси работает; в finally
-    # это глушится, чтобы не качать GitHub из «офнутого» приложения.
+    # Домены CF берём из встроенного списка, без фоновой загрузки с GitHub.
     if proxy_config.fallback_cfproxy:
         user_domains = getattr(proxy_config, 'cfproxy_user_domains', [])
         if user_domains:
@@ -698,7 +697,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
         else:
             balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
             proxy_config.active_cfproxy_domain = random.choice(CFPROXY_DEFAULT_DOMAINS)
-            start_cfproxy_domain_refresh()
     secret_bytes = bytes.fromhex(proxy_config.secret)
 
     def client_cb(r, w):
@@ -839,12 +837,6 @@ async def _run(stop_event: Optional[asyncio.Event] = None):
             await _ws_pool.aclose()
         except Exception:
             log.debug("WS pool close failed", exc_info=True)
-        # CF-домены refresher: прокси останавливается — поток не должен
-        # продолжать качать GitHub раз в час.
-        try:
-            shutdown_cfproxy_domain_refresh()
-        except Exception:
-            log.debug("cfproxy refresh shutdown failed", exc_info=True)
         # Задачи WS-пула (_refill/_connect_one) висят с таймаутами до 8с и без
         # отмены loop закрывается с «pending» → шум "Task was destroyed...".
         # Отменяем все прочие задачи и ждём их, чтобы шатдаун был чистым.

@@ -1,23 +1,8 @@
-import logging
 import os
-import string
-import random
 import socket as _socket
-import threading
 
 from dataclasses import dataclass, field
 from typing import Dict, List
-from urllib.request import Request
-
-from .balancer import balancer
-from .utils import build_github_opener
-
-log = logging.getLogger('tg-mtproto-proxy')
-
-CFPROXY_DOMAINS_URL = (
-    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main"
-    "/.github/cfproxy-domains.txt"
-)
 
 _CFPROXY_ENC: List[str] = [
     'virkgj.com', 
@@ -56,7 +41,6 @@ def _dd(s: str) -> str:
 
 
 CFPROXY_DEFAULT_DOMAINS: List[str] = [_dd(d) for d in _CFPROXY_ENC]
-_CFPROXY_MIN_VALID_DOMAINS = 3
 
 
 @dataclass
@@ -85,106 +69,6 @@ class ProxyConfig:
 
 
 proxy_config = ProxyConfig()
-
-
-def coerce_domain_list(value) -> List[str]:
-    if isinstance(value, str):
-        items = value.replace(',', ' ').replace(';', ' ').split()
-    elif isinstance(value, (list, tuple)):
-        items: List[str] = []
-        for entry in value:
-            if isinstance(entry, str):
-                items.extend(entry.replace(',', ' ').replace(';', ' ').split())
-    else:
-        return []
-    seen = set()
-    result: List[str] = []
-    for item in items:
-        item = item.strip()
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result
-
-
-def _fetch_cfproxy_domain_list() -> List[str]:
-    try:
-        req = Request(CFPROXY_DOMAINS_URL + "?" + "".join(random.choices(string.ascii_letters, k=7)),
-                       headers={'User-Agent': 'tg-ws-proxy'})
-        with build_github_opener().open(req, timeout=10) as resp:
-            text = resp.read().decode('utf-8', errors='replace')
-        encoded = [
-            line.strip() for line in text.splitlines()
-            if line.strip() and not line.startswith('#')
-        ]
-        return [_dd(d) for d in encoded]
-    except Exception as exc:
-        log.warning("Failed to fetch CF proxy domain list: %s", repr(exc))
-        return []
-
-
-def _is_valid_domain(domain: str) -> bool:
-    if not domain or len(domain) > 253:
-        return False
-    if domain.startswith('.') or domain.endswith('.'):
-        return False
-    labels = domain.split('.')
-    if len(labels) < 2:
-        return False
-    for label in labels:
-        if not label or len(label) > 63:
-            return False
-        if label[0] == '-' or label[-1] == '-':
-            return False
-        if not all(ch.isalnum() or ch == '-' for ch in label):
-            return False
-    tld = labels[-1]
-    if len(tld) < 2 or not any(ch.isalpha() for ch in tld):
-        return False
-    return True
-
-
-def _normalize_domain_pool(domains: List[str]) -> List[str]:
-    seen = set()
-    normalized: List[str] = []
-    for domain in domains:
-        item = domain.strip().lower()
-        if not _is_valid_domain(item):
-            continue
-        if item in seen:
-            continue
-        seen.add(item)
-        normalized.append(item)
-    return normalized
-
-
-def refresh_cfproxy_domains() -> None:
-    """Обновление CF proxy доменов из GitHub отключено: используем только встроенный список."""
-    return
-
-
-_refresh_stop: threading.Event = threading.Event()
-
-
-def start_cfproxy_domain_refresh() -> None:
-    global _refresh_stop
-    _refresh_stop.set()
-    _refresh_stop = threading.Event()
-
-    balancer.update_domains_list(CFPROXY_DEFAULT_DOMAINS)
-    log.info("CF proxy domains: using built-in list (%d domains), GitHub refresh disabled",
-             len(CFPROXY_DEFAULT_DOMAINS))
-
-
-def shutdown_cfproxy_domain_refresh() -> None:
-    """Остановить фоновый refresher при выключении прокси."""
-    stop_event = globals().get('_refresh_stop')
-    if stop_event is not None:
-        stop_event.set()
 
 
 def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:

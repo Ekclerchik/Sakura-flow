@@ -217,7 +217,6 @@ async def _cfproxy_worker_fallback(reader, writer, relay_init, label,
                                                 secure=False)
                 break
             except Exception as exc:
-                cf_worker_pool.report_failure(worker_domain, exc)
                 log.warning("[%s] DC%d%s CF worker %s failed: %s",
                             label, dc, media_tag, worker_domain, repr(exc))
                 continue

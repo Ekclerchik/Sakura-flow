@@ -1176,8 +1176,8 @@ def _show_first_run():
         "\u2460 Нажми на иконку \U0001F338 \u2014 откроется меню<br>"
         "\u2461 Выбери <b>\u26A1 Start</b> \u2014 включится обход блокировок<br>"
         "\u2462 Готово \u2705 YouTube, Discord, Rocket League \u2014 вс\u0451 работает.<br>"
-        "&nbsp;&nbsp;&nbsp;<b>GameFilter:</b> TCP+UDP (рекомендуется) \u2699\uFE0F<br>"
-        "&nbsp;&nbsp;&nbsp;<b>IPSet:</b> any (рекомендуется) \u2699\uFE0F<br>"
+        "&nbsp;&nbsp;&nbsp;<b>GameFilter:</b> OFF (рекомендуется) \u2699\uFE0F<br>"
+        "&nbsp;&nbsp;&nbsp;<b>IPSet:</b> none (рекомендуется) \u2699\uFE0F<br>"
         "&nbsp;&nbsp;&nbsp;Настройки в \U0001F6E0\uFE0F Network Tools \u2192 GameFilter / IPSet<br><br>"
         "<b>Для Telegram:</b><br>"
         "\u2463 Открой \U0001F6E0\uFE0F Network Tools<br>"
@@ -1448,6 +1448,10 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     def _on_autostart_toggled(chk):
         _autostart_user_set["v"] = True
         _set_autostart(chk)
+        # Включили автозапуск — поднимаем стратегию сразу, а не только после
+        # следующего логона. Если она уже идёт, toggle сам ничего не испортит.
+        if chk and not _strategy_busy["on"] and not _winws_cached["v"]:
+            toggle_strategy(start_btn)
 
     autostart_action.toggled.connect(_on_autostart_toggled)
     threading.Thread(target=_check_autostart, daemon=True).start()
@@ -1469,9 +1473,9 @@ def create_tray_app(bat_files, register_sleep_handler=None):
             pass
 
     def app_restart():
-        # Механика как в эталонной 3.3.9: сначала поднимаем новый экземпляр,
-        # потом синхронно гасим службу и выходим. Остановка быстрая (sc stop →
-        # taskkill winws), поэтому трей и меню исчезают сразу.
+        # Сначала синхронно гасим службу, потом поднимаем новый экземпляр и
+        # выходим. Остановка быстрая (sc stop → taskkill winws), поэтому трей
+        # и меню исчезают сразу.
         # Не уводить service.stop_service() в фоновый поток (ИНВАРИАНТ 6).
         # Прячем popup-меню до синхронной остановки (см. app_exit).
         try:
@@ -1483,14 +1487,18 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         except Exception:
             pass
         _hide_all_windows()
-        try:
-            subprocess.Popen([sys.executable] + sys.argv, creationflags=0x08000000)
-        except Exception as e:
-            logging.error(f"[app] restart spawn error: {e}")
+        # Сначала останавливаем службу, потом поднимаем новый процесс. Раньше
+        # было наоборот: новый процесс видел ещё живую службу, start_service
+        # с force=False пропускал старт, а старый процесс затем её гасил —
+        # после Restart стратегия оставалась выключенной.
         try:
             service.stop_service()
         except Exception as e:
             logging.error(f"[app] restart stop error: {e}")
+        try:
+            subprocess.Popen([sys.executable] + sys.argv, creationflags=0x08000000)
+        except Exception as e:
+            logging.error(f"[app] restart spawn error: {e}")
         QApplication.quit()
 
     def app_exit():

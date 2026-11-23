@@ -35,12 +35,15 @@ except ImportError:
 
 def _set_defaults():    
     app_state = state.load_state()
+    # Безопасные дефолты: TCP+UDP + IPSet any включают общий десинк на всех
+    # портах/адресах и ломают игры (Dota, Rocket League). YouTube-профили
+    # работают через точечные hostlist-domains и от ipset не зависят.
     if app_state.get("game_filter_mode") is None:
-        tools.set_game_filter_mode("all")
-        state.save_state(game_filter_mode="all")
+        tools.set_game_filter_mode("disabled")
+        state.save_state(game_filter_mode="disabled")
     if app_state.get("ipset_mode") is None:
-        tools.set_ipset_mode("any")
-        state.save_state(ipset_mode="any")
+        tools.set_ipset_mode("none")
+        state.save_state(ipset_mode="none")
 
 try:
     import faulthandler
@@ -187,7 +190,21 @@ def _main_inner():
 
         threading.Thread(target=_restore_mtproto, daemon=True).start()
 
+    launched_by_autostart = autostart.AUTOSTART_ARG in sys.argv
+
     last_bat = app_state.get("last_bat")
+    if not last_bat and launched_by_autostart:
+        # Первый логон: last_bat ещё пустой, но автозапуск включён — стартуем
+        # дефолтную стратегию, иначе трей появляется без обхода.
+        preferred = config.BAT_DIR / "general (FAKE TLS AUTO ALT3).bat"
+        if preferred.exists():
+            last_bat = preferred.stem
+        elif bat_files:
+            last_bat = bat_files[0].stem
+        if last_bat:
+            state.save_state(last_bat=last_bat, stopped=False)
+            logging.info(f"[STRATEGY] Автозапуск: стратегия по умолчанию {last_bat}")
+
     if last_bat:
         logging.info(f"[STRATEGY] Восстановление стратегии: {last_bat}")
         for b in bat_files:
