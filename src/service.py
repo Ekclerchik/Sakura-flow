@@ -89,6 +89,10 @@ except ImportError:  # не-Windows окружение / тесты
 # новое консольное окно, которое мелькает при каждой операции со службой.
 _NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW
 
+# 0x8032000A FWP_E_IN_USE — старые фильтры WinDivert/WFP ещё не освободились
+# после предыдущего winws. Служба сразу падает, sc start висит без RUNNING.
+_FWP_E_IN_USE = 2150760458
+
 
 # sc.exe query выдаёт статус на языке ОС (RU: РАБОТАЕТ/ОСТАНОВЛЕН).
 _RUN_RE = re.compile(r"\b(RUNNING|РАБОТАЕТ)\b", re.IGNORECASE)
@@ -199,7 +203,9 @@ def describe_start_failure():
 
     facts = []
     code = _service_exit_code()
-    if code not in (None, 0, 1073):
+    if code == _FWP_E_IN_USE:
+        facts.append("FWP_E_IN_USE (0x8032000A): старые фильтры WinDivert ещё не освободились")
+    elif code not in (None, 0, 1073):
         facts.append(f"код выхода службы: {code} "
                      f"(1067 = winws аварийно завершился при старте)")
     if windivert_stuck():
@@ -720,14 +726,29 @@ def _start_locked(batch_path, display_version):
         # вызывающим кодом и пишется в лог
         logging.error(f"[SERVICE] Не удалось создать службу: {e}")
         return False
-    run_cmd(f'sc.exe start "{SERVICE_NAME}"')
-    ok = _wait_service_running()
-    if not ok:
-        # Раньше тут было сухое «failed to reach RUNNING». Теперь разбираем
-        # реальную причину (ошибка winws, код выхода службы, файлы, драйвер).
-        logging.error("[SERVICE] winws не запустился (служба не дошла до "
-                      "RUNNING).\n" + describe_start_failure())
-    return ok
+    for attempt in range(3):
+        # Без timeout'а sc.exe start висел навсегда, когда служба падала до
+        # RUNNING (FWP_E_IN_USE) — GUI оставался на «Starting...».
+        run_cmd(f'sc.exe start "{SERVICE_NAME}"', timeout=15)
+        if _wait_service_running():
+            return True
+        # 0x8032000A: предыдущие фильтры ещё не освободились (быстрый
+        # Stop→Start). Ждём и пересоздаём службу, не прося перезагрузки.
+        if _service_exit_code() != _FWP_E_IN_USE or attempt == 2:
+            break
+        logging.warning(
+            "[SERVICE] FWP_E_IN_USE (0x8032000A): фильтры ещё заняты, "
+            "повторяю старт через %d с", 2 * (attempt + 1))
+        _stop_locked()
+        time.sleep(2 * (attempt + 1))
+        try:
+            create_service(batch_path, display_version)
+        except Exception as e:
+            logging.error(f"[SERVICE] Не удалось пересоздать службу: {e}")
+            return False
+    logging.error("[SERVICE] winws не запустился (служба не дошла до "
+                  "RUNNING).\n" + describe_start_failure())
+    return False
 
 
 # ----------------------------------------------------------------------------

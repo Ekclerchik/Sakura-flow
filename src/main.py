@@ -35,15 +35,13 @@ except ImportError:
 
 def _set_defaults():    
     app_state = state.load_state()
-    # Безопасные дефолты: TCP+UDP + IPSet any включают общий десинк на всех
-    # портах/адресах и ломают игры (Dota, Rocket League). YouTube-профили
-    # работают через точечные hostlist-domains и от ipset не зависят.
+    # Дефолты: TCP+UDP и IPSet any — нормальный общий десинк.
     if app_state.get("game_filter_mode") is None:
-        tools.set_game_filter_mode("disabled")
-        state.save_state(game_filter_mode="disabled")
+        tools.set_game_filter_mode("all")
+        state.save_state(game_filter_mode="all")
     if app_state.get("ipset_mode") is None:
-        tools.set_ipset_mode("none")
-        state.save_state(ipset_mode="none")
+        tools.set_ipset_mode("any")
+        state.save_state(ipset_mode="any")
 
 try:
     import faulthandler
