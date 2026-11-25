@@ -4,12 +4,14 @@
 ИНВАРИАНТЫ START/STOP — НЕ ЛОМАТЬ (проверено эмпирически против Sakura-flow-3.3.9)
 ================================================================================
 
-1) Драйвер WinDivert приложение НЕ останавливает НИКОГДА и НИГДЕ.
-   Запрещено `sc stop "WinDivert"` (раньше был в _stop_locked и _start_locked).
-   Гонка при остановке подвешивает драйвер в STOP_PENDING, после чего winws не
-   стартует до ПЕРЕЗАГРУЗКИ ПК. Эталон 3.3.9 драйвер не трогает вообще.
-   (Симптом в логе: «WinDivert залип в STOP_PENDING». Не «лечить» это повторной
-   остановкой драйвера — только усугубит.)
+1) Драйвер WinDivert НЕ трогаем при старте/стопе/рестарте — только при
+   ФИНАЛЬНОМ Exit (shutdown_service → _stop_windivert_for_exit), когда winws
+   уже убит и служба удалена. Раньше `sc stop "WinDivert"` в _stop_locked /
+   _start_locked подвешивал драйвер в STOP_PENDING, после чего winws не
+   стартует до ПЕРЕЗАГРУЗКИ ПК. На выходе это безопасно: следующий запуск
+   WinDivert.dll поднимет драйвер заново. (Симптом в логе: «WinDivert залип в
+   STOP_PENDING». Не «лечить» повторной остановкой в старте/стопе — только
+   усугубит.)
 
 2) windivert_stuck() == True ТОЛЬКО при STOP_PENDING.
    RUNNING + START_TYPE=disabled — это НОРМА: WinDivert.dll поднимает драйвер по
@@ -32,9 +34,10 @@
    приходят из разных потоков (трей, редактор списков, обработчик сна) и без
    блокировки гоняются друг с другом (sc create/delete → 1072/183).
 
-6) Exit/Restart в ui.py гасят службу СИНХРОННО в GUI-потоке (stop_service →
-   QApplication.quit) — без фоновых потоков и без «моста»: трей и меню должны
-   исчезать сразу.
+6) Exit/Restart в ui.py гасят службу СИНХРОННО в GUI-потоке — без фоновых
+   потоков и без «моста»: трей и меню должны исчезать сразу. Exit зовёт
+   shutdown_service (служба + winws + драйвер), Restart — только stop_service:
+   драйвер оставляем, иначе новый процесс поднимется на STOP_PENDING.
 
 7) winws.exe гасится `taskkill /F /IM winws.exe /T`; служба
    SakuraFlowService — через sc (stop/delete). Не путать эти сущности.
@@ -70,8 +73,15 @@
    и НЕ убирать watchdog: это снова даёт FWP_E_IN_USE (0x8032000A) и вечный
    «Starting...» в трее. Проверено против рабочей папки SakuraFlow\\SakuraFlow.
 
+12) Exit НЕ берёт _service_lock. Если воркер висит в sc.exe, синхронная
+    остановка морозит GUI после того, как меню уже спрятано: «оболочка ушла,
+    процесс остался». shutdown_service ставит _shutting_down, гасит winws /
+    службу / драйвер прямыми командами с короткими таймаутами и зовёт
+    os._exit(0). Restart/Stop остаются под _service_lock.
+
 ================================================================================
 """
+import os
 import subprocess
 import re
 import time
@@ -105,6 +115,9 @@ _NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW
 # 0x8032000A FWP_E_IN_USE — старые фильтры WinDivert/WFP ещё не освободились
 # после предыдущего winws. Служба сразу падает, sc start висит без RUNNING.
 _FWP_E_IN_USE = 2150760458
+
+# Имя драйвера в SCM. Один и тот же ключ и для диагностики, и для финального Exit.
+_WINDIVERT_SERVICE = "WinDivert"
 
 
 # sc.exe query выдаёт статус на языке ОС (RU: РАБОТАЕТ/ОСТАНОВЛЕН).
@@ -274,7 +287,7 @@ def windivert_stuck():
 
 def _windivert_state():
     """Состояние WinDivert одним запросом (без cmd.exe-обёртки)."""
-    return _service_state("WinDivert")
+    return _service_state(_WINDIVERT_SERVICE)
 
 
 # ============================================================================
@@ -479,6 +492,10 @@ def _diag_environment_lines(ts=None, windivert=None):
 # могут приходить из разных потоков (трей, редактор списков, обработчик
 # пробуждения) и без неё гоняются друг с другом (sc create/delete → 1072/183).
 _service_lock = threading.Lock()
+
+# Exit выставляет флаг без блокировки: воркер, застрявший в sc.exe, должен
+# увидеть его и не пересоздать службу после нашей принудительной очистки.
+_shutting_down = False
 
 
 def restart_service(batch_path, display_version):
@@ -716,6 +733,8 @@ def _start_locked(batch_path, display_version):
     #   create_service() -> sc start -> ждать RUNNING.
     # Драйвер WinDivert не трогаем (ИНВАРИАНТ 1); службу обязательно удалить
     # перед create (ИНВАРИАНТ 3).
+    if _shutting_down:
+        return False
     wd_state = None
     if service_exists():
         # _stop_locked() останавливает и УДАЛЯЕТ службу (sc create падает с 1073
@@ -751,6 +770,8 @@ def _start_locked(batch_path, display_version):
     # стартовал «в никуда»). При таймауте старт продолжается как есть
     # (не блокируем навсегда).
     _wait_for_network()
+    if _shutting_down:
+        return False
 
     for line in _diag_environment_lines(ts=ts_state, windivert=wd_state):
         logging.info(f"[SERVICE] Состояние на старте: {line}")
@@ -763,6 +784,8 @@ def _start_locked(batch_path, display_version):
         logging.error(f"[SERVICE] Не удалось создать службу: {e}")
         return False
     for attempt in range(3):
+        if _shutting_down:
+            return False
         # Без timeout'а sc.exe start висел навсегда, когда служба падала до
         # RUNNING (FWP_E_IN_USE) — GUI оставался на «Starting...».
         run_cmd(f'sc.exe start "{SERVICE_NAME}"', timeout=15)
@@ -777,6 +800,8 @@ def _start_locked(batch_path, display_version):
             "повторяю старт через %d с", 2 * (attempt + 1))
         _stop_locked()
         time.sleep(2 * (attempt + 1))
+        if _shutting_down:
+            return False
         try:
             create_service(batch_path, display_version)
         except Exception as e:
@@ -869,3 +894,66 @@ def start_service(batch_path, display_version, force=False):
 def stop_service():
     with _service_lock:
         _stop_locked()
+
+
+def _stop_windivert_for_exit(wd_state=None, wait=6):
+    """Финальный Exit: выгружаем драйвер, чтобы Windows отпустила WinDivert64.sys.
+
+    Только здесь можно трогать WinDivert — см. ИНВАРИАНТ 1. Один `sc stop`,
+    без ретраев: повторные остановки подвешивают драйвер в STOP_PENDING.
+    """
+    state = wd_state if wd_state is not None else _windivert_state()
+    if state in (None, "нет", "STOPPED"):
+        return
+    if state == "STOP_PENDING":
+        logging.warning("[SERVICE] WinDivert уже в STOP_PENDING — повторно не останавливаю")
+        return
+
+    logging.info("[SERVICE] Exit: останавливаю WinDivert ...")
+    run_cmd(f'sc.exe stop "{_WINDIVERT_SERVICE}"', timeout=wait + 3)
+
+    start = time.time()
+    while time.time() - start < wait:
+        state = _windivert_state()
+        if state in (None, "нет", "STOPPED"):
+            logging.info("[SERVICE] WinDivert остановлен — файл драйвера освобождён")
+            return
+        if state != "STOP_PENDING":
+            break
+        time.sleep(0.25)
+    logging.warning(f"[SERVICE] WinDivert не дошёл до STOPPED за {wait}с (состояние: {state})")
+
+
+def _force_exit_cleanup():
+    """Прямые команды БЕЗ _service_lock: воркер Starting может держать его вечно."""
+    logging.info("[SERVICE] Exit: принудительная остановка (без _service_lock)")
+
+    # winws первым: именно он держит WFP-фильтры и файлы в папке Sakura Flow.
+    run_cmd('taskkill /F /IM winws.exe /T', timeout=5)
+
+    if service_exists():
+        run_cmd(f'sc.exe stop "{SERVICE_NAME}"', timeout=5)
+        _wait_service_stopped(timeout=3)
+    # delete даже если stop не уложился: SCM удалит службу после выгрузки winws.
+    run_cmd(f'sc.exe delete "{SERVICE_NAME}"', timeout=5)
+    _stop_windivert_for_exit(wait=3)
+
+    # воркер мог пересоздать службу между командами — добиваем перед смертью.
+    time.sleep(0.2)
+    run_cmd('taskkill /F /IM winws.exe /T', timeout=3)
+    run_cmd(f'sc.exe delete "{SERVICE_NAME}"', timeout=3)
+
+
+def shutdown_service():
+    """Exit: гасим всё и убиваем процесс, даже если воркер висит в sc.exe."""
+    global _shutting_down
+    _shutting_down = True
+    try:
+        _force_exit_cleanup()
+    except Exception as e:
+        logging.error(f"[SERVICE] Exit cleanup error: {e}")
+    finally:
+        try:
+            logging.shutdown()
+        finally:
+            os._exit(0)

@@ -1492,7 +1492,8 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     def app_restart():
         # Сначала синхронно гасим службу, потом поднимаем новый экземпляр и
         # выходим. Остановка быстрая (sc stop → taskkill winws), поэтому трей
-        # и меню исчезают сразу.
+        # и меню исчезают сразу. Драйвер НЕ трогаем (не shutdown_service!):
+        # новый процесс поднимет winws на уже работающем WinDivert.
         # Не уводить service.stop_service() в фоновый поток (ИНВАРИАНТ 6).
         # Прячем popup-меню до синхронной остановки (см. app_exit).
         try:
@@ -1519,14 +1520,10 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         QApplication.quit()
 
     def app_exit():
-        # Выход гасит всё синхронно (как в эталонной 3.3.9): служба + winws, затем
-        # выход. Без фоновых потоков и моста — меню и иконка исчезают сразу.
-        # service.stop_service() НЕ уводить в фоновый поток и не добавлять
-        # ожиданий — иначе трей/меню зависают (ИНВАРИАНТ 6 в service.py).
-        # ВАЖНО: сначала прячем popup-меню. StickyMenu намеренно НЕ закрывается
-        # после клика (чтобы меню жило для Start/Stop), а stop_service()
-        # синхронно морозит GUI-поток — без этого окно меню остаётся на экране
-        # замороженным и «висит» до смерти процесса.
+        # Выход гасит службу + winws + драйвер WinDivert и убивает процесс
+        # через os._exit — не ждёт _service_lock. Иначе при зависшем Starting
+        # воркер держит лок, меню уже спрятано, а процесс остаётся живым.
+        # См. ИНВАРИАНТ 12 в service.py; Restart по-прежнему зовёт stop_service.
         try:
             menu.hide()
         except Exception:
@@ -1539,10 +1536,10 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         # задач остаётся «мёртвой» иконкой после выхода (см. _hide_all_windows).
         _hide_all_windows()
         try:
-            service.stop_service()
+            service.shutdown_service()  # сам зовёт os._exit(0)
         except Exception as e:
-            logging.error(f"[app] exit stop error: {e}")
-        QApplication.quit()
+            logging.error(f"[app] exit shutdown error: {e}")
+            os._exit(0)
 
     menu.addAction("  🔁 Restart", app_restart)
     menu.addSeparator()
