@@ -57,6 +57,19 @@
    RUNNING с той же стратегией и живым winws (метка стратегии в реестре):
    логон-восстановление после ребута не должен дёргать рабочую службу.
    force=True — безусловный старт: quick_restart и перезапуск после сна.
+11) РАБОТАЕТ ТАК И НИКАК ИНАЧЕ: stop → ждать STOPPED → безусловный
+   `taskkill /F /IM winws.exe /T` → sc delete → sc create с binPath ПРЯМО на
+   winws.exe (НЕ cmd.exe /c — иначе SCM не дождётся регистрации и уронит
+   службу с 1053) → `sc.exe start` С ТАЙМАУТОМ + ретрай FWP_E_IN_USE.
+   Все query состояния идут через _sc_query БЕЗ cmd.exe, а уже полученные
+   WinDivert/timestamps переиспользуются в диагностике — не дёргаем netsh/sc
+   по несколько раз за один старт. Внешние команды идут
+   через run_cmd с таймаутом по умолчанию; в ui.py есть watchdog на 25 с,
+   который снимает «Starting...», если воркер застрял на _service_lock.
+   НЕ возвращать мягкое ожидание winws перед kill, НЕ ставить timeout=None
+   и НЕ убирать watchdog: это снова даёт FWP_E_IN_USE (0x8032000A) и вечный
+   «Starting...» в трее. Проверено против рабочей папки SakuraFlow\\SakuraFlow.
+
 ================================================================================
 """
 import subprocess
@@ -133,13 +146,14 @@ def _wait_service_running(timeout=15):
     return False
 
 
-def _sc_query():
+def _sc_query(name=SERVICE_NAME):
     """sc.exe query списком аргументов БЕЗ shell: run_cmd(shell=True) спавнит
     cmd.exe + sc.exe (2 процесса) на КАЖДЫЙ опрос, а опросы идут каждые 0.5с
-    в циклах ожидания (до ~50 подпроцессов за один старт/стоп службы)."""
+    в циклах ожидания (до ~50 подпроцессов за один старт/стоп службы).
+    Используется ВСЕМИ запросами состояния — не только циклами ожидания."""
     try:
         return subprocess.run(
-            ['sc.exe', 'query', SERVICE_NAME],
+            ['sc.exe', 'query', name],
             capture_output=True, text=True, encoding=CONSOLE_ENCODING,
             timeout=10, creationflags=_NO_WINDOW)
     except subprocess.TimeoutExpired:
@@ -186,7 +200,7 @@ def winws_filter_error():
 
 def _service_exit_code():
     """WIN32_EXIT_CODE службы (1067 = winws аварийно завершился на старте)."""
-    q = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
+    q = _sc_query()
     out = (q.stdout or "") if q else ""
     m = re.search(r"WIN32_EXIT_CODE\s*:\s*(\d+)", out)
     try:
@@ -255,8 +269,12 @@ def windivert_stuck():
     которого winws не давали запустить на живом рабочем драйвере.
     См. ИНВАРИАНТ 2: НЕ возвращать проверку START_TYPE/DISABLED.
     """
-    result = run_cmd('sc.exe query "WinDivert"')
-    return bool(result) and bool(_STOP_PENDING_RE.search(result.stdout or ""))
+    return _windivert_state() == "STOP_PENDING"
+
+
+def _windivert_state():
+    """Состояние WinDivert одним запросом (без cmd.exe-обёртки)."""
+    return _service_state("WinDivert")
 
 
 # ============================================================================
@@ -321,7 +339,7 @@ def _ensure_tcp_timestamps():
     Стратегии с --dpi-desync-fooling=ts БЕЗ них не десинкают (баг 2)."""
     state = _tcp_timestamps_enabled()
     if state is True:
-        return True
+        return True  # уже включены — второй netsh не нужен
     logging.info("[SERVICE] TCP timestamps выключены — включаю "
                  "(порт :tcp_enable; без них --dpi-desync-fooling=ts не работает)")
     run_cmd("netsh interface tcp set global timestamps=enabled", timeout=15)
@@ -334,9 +352,12 @@ def _ensure_tcp_timestamps():
 
 def _prepare_start_environment():
     """Сводный шаг подготовки окружения перед create/start (см. блок выше).
-    БЫСТРЫЙ и без 'долгого ожидания' — инвариант 9."""
-    _ensure_tcp_timestamps()
+    БЫСТРЫЙ и без 'долгого ожидания' — инвариант 9.
+    Возвращает уже проверенное состояние timestamps, чтобы диагностика не
+    дёргала netsh третий раз за один старт."""
+    ts_state = _ensure_tcp_timestamps()
     _ensure_user_lists()
+    return ts_state
 
 
 # ============================================================================
@@ -417,7 +438,7 @@ def _wait_for_network(timeout=60):
 
 def _service_state(name):
     """Краткое состояние службы (RUNNING/STOPPED/STOP_PENDING/нет/None)."""
-    result = run_cmd(f'sc.exe query "{name}"', timeout=10)
+    result = _sc_query(name)
     if not result:
         return None
     out = result.stdout or ""
@@ -432,19 +453,24 @@ def _service_state(name):
     return "неизвестно"
 
 
-def _diag_environment_lines():
+def _diag_environment_lines(ts=None, windivert=None):
     """Список строк-фактов окружения на момент старта winws. Логируется при
     каждом запуске и добавляется в describe_start_failure — разбор жалоб
-    «не десинкается» не должен требовать вопросов к пользователю (баги 2/3)."""
-    ts = _tcp_timestamps_enabled()
+    «не десинкается» не должен требовать вопросов к пользователю (баги 2/3).
+    ts/windivert передаёт _start_locked, чтобы не повторять уже сделанные
+    netsh и sc query; failure-путь вызывает без аргументов и проверяет заново."""
+    if ts is None:
+        ts = _tcp_timestamps_enabled()
     ts_txt = ("включены" if ts else
               "ВЫКЛЮЧЕНЫ — --dpi-desync-fooling=ts не сработает" if ts is False else
               "не удалось проверить")
+    if windivert is None:
+        windivert = _windivert_state()
     lines = [
         f"маршрут по умолчанию: {'есть' if _has_default_route() else 'НЕТ'}",
         f"активное подключение: {_active_connection_desc()}",
         f"TCP timestamps: {ts_txt}",
-        f"WinDivert: {_service_state('WinDivert')}; BFE: {_service_state('bfe')}",
+        f"WinDivert: {windivert}; BFE: {_service_state('bfe')}",
     ]
     return lines
 
@@ -462,7 +488,10 @@ def restart_service(batch_path, display_version):
         return _start_locked(batch_path, display_version)
 
 
-def run_cmd(cmd, timeout=None):
+def run_cmd(cmd, timeout=15):
+    """Все вызовы sc/netsh/taskkill ограничены по времени по умолчанию.
+    Раньше timeout=None означал «ждать вечно»: зависший sc query/scripts держал
+    _service_lock, а UI-воркер вместе с ним — кнопка залипала на Starting."""
     logging.info(f"Выполнение команды: {cmd}")
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True,
@@ -477,8 +506,10 @@ def run_cmd(cmd, timeout=None):
 
 
 def service_exists():
-    result = run_cmd(f'sc.exe query "{SERVICE_NAME}"')
-    return result and result.stdout
+    # 1060 — службы нет. Раньше брали любой stdout, из-за чего сообщение
+    # «OpenService: ошибка 1060» считалось существующей службой.
+    result = _sc_query()
+    return bool(result) and result.returncode != 1060 and bool(result.stdout)
 
 
 def _delete_locked():
@@ -509,24 +540,22 @@ def _stop_locked():
     STOP_PENDING, после чего winws не стартует до перезагрузки ПК.
     Порядок шагов — ИНВАРИАНТ 4; длинных ожиданий (_wait_service_gone и т.п.)
     и фоновых остановок сюда НЕ добавлять (дали Stop ~24 c)."""
+    wd_state = None  # состояние WinDivert отдаём _start_locked — не спрашиваем дважды
     if service_exists():
         logging.info("Остановка SakuraFlowService...")
         run_cmd(f'sc.exe stop "{SERVICE_NAME}"', timeout=30)
         _wait_service_stopped()
-        # Даём winws коротко выйти самому и освободить WinDivert/WFP-фильтры.
-        # Безусловный taskkill /F сразу после STOPPED может оборвать очистку
-        # фильтров и оставить FWP_E_IN_USE (0x8032000A) до перезагрузки.
-        deadline = time.time() + 1.0
-        while _winws_running() and time.time() < deadline:
-            time.sleep(0.2)
-        if _winws_running():
-            run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
+        # Как в эталонной 3.3.9: taskkill /F безусловно сразу после STOPPED.
+        # «Мягкое» ожидание 1с оставляло WFP-фильтры занятыми и давало
+        # FWP_E_IN_USE (0x8032000A) при следующем старте.
+        run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
         # Удаляем службу (create_service создаёт её с delayed-auto): иначе после
         # Stop/Exit Windows всё равно поднимет winws через пару минут после
         # загрузки ПК. Это же обязательно перед следующим стартом — sc create не
         # пересоздаёт существующую службу и падал с 1073 «служба уже существует».
         _delete_locked()
-        if windivert_stuck():
+        wd_state = _windivert_state()
+        if wd_state == "STOP_PENDING":
             logging.error("[SERVICE] WinDivert залип в STOP_PENDING — потребуется перезагрузка ПК")
     else:
         # Службы нет, а winws.exe мог остаться «сиротой» (служба удалена,
@@ -535,6 +564,7 @@ def _stop_locked():
         if _winws_running():
             logging.warning("[SERVICE] Служба не найдена, а winws.exe работает — сирота, завершаю")
             run_cmd('taskkill /F /IM winws.exe /T', timeout=15)
+    return wd_state
 
 
 def _extract_winws_command(bat_content):
@@ -637,12 +667,13 @@ def parse_bat_file(batch_path):
 def create_service(batch_path, display_version):
     executable, args = parse_bat_file(batch_path)
     service_display = f"Sakura Flow version[{display_version}]"
-    bin_dir = Path(executable).parent
-    # Служба выполняется инлайн-командой cmd.exe, БЕЗ пакетного файла и БЕЗ
-    # редиректа в файл: сами стратегию не логируем (winws пишет по пакету —
-    # файл раздувается), а причину сбоя старта объясняем в describe_start_failure
-    # (код выхода службы + состояние драйвера/файлов + список вероятных причин).
-    cmd_line = f'cmd.exe /c "cd /d "{bin_dir}" && "{executable}" {args}"'
+    # ПРЯМОЙ binPath на winws.exe — как в zapret\service.bat (строка 348).
+    # winws сам вызывает StartServiceCtrlDispatcher и сообщает SCM RUNNING.
+    # Обёртка cmd.exe /c ... этого НЕ делает: SCM видит cmd.exe, не дождётся
+    # регистрации и роняет службу с 1053 (ERROR_SERVICE_REQUEST_TIMEOUT),
+    # хотя winws даже не успевал стартовать. Все пути в args уже абсолютные
+    # (parse_bat_file подставил %BIN%/%LISTS%), cd /d не нужен.
+    cmd_line = f'"{executable}" {args}'
 
     cmd_args = [
         'sc.exe', 'create', SERVICE_NAME,
@@ -660,7 +691,8 @@ def create_service(batch_path, display_version):
     result = None
     for attempt in range(5):
         result = subprocess.run(cmd_args, capture_output=True, text=True,
-                                encoding=CONSOLE_ENCODING, creationflags=_NO_WINDOW)
+                                encoding=CONSOLE_ENCODING, timeout=15,
+                                creationflags=_NO_WINDOW)
         if result.returncode == 0:
             # Метка созданной стратегии: по ней start_service(force=False)
             # узнаёт, что служба уже несёт нужную стратегию, и не пересоздаёт
@@ -684,10 +716,12 @@ def _start_locked(batch_path, display_version):
     #   create_service() -> sc start -> ждать RUNNING.
     # Драйвер WinDivert не трогаем (ИНВАРИАНТ 1); службу обязательно удалить
     # перед create (ИНВАРИАНТ 3).
+    wd_state = None
     if service_exists():
         # _stop_locked() останавливает и УДАЛЯЕТ службу (sc create падает с 1073
-        # на существующей), затем создаём заново.
-        _stop_locked()
+        # на существующей), затем создаём заново. Состояние WinDivert оно уже
+        # получило — второй sc query не делаем.
+        wd_state = _stop_locked()
     elif _winws_running():
         # winws, запущенный вне Sakura (например из консоли/старой версии),
         # не даст драйверу корректно стартовать новую службу — чистим.
@@ -699,7 +733,9 @@ def _start_locked(batch_path, display_version):
     # если драйвер залип в STOP_PENDING — winws не стартует до перезагрузки ПК;
     # честно сообщаем, а не молча создаём мёртвую службу.
     # RUNNING-драйвер с START_TYPE=disabled зависшим НЕ считаем (см. windivert_stuck).
-    if windivert_stuck():
+    if wd_state is None:
+        wd_state = _windivert_state()
+    if wd_state == "STOP_PENDING":
         logging.error("[SERVICE] WinDivert залип в STOP_PENDING — winws не "
                       "запустится до перезагрузки ПК")
         return False
@@ -707,7 +743,7 @@ def _start_locked(batch_path, display_version):
     # Подготовка окружения (ПЕРЕД create): наш старт обходит service.bat, поэтому
     # шаги :tcp_enable/:load_user_lists никогда не выполнялись. Без timestamps
     # стратегии с --dpi-desync-fooling=ts молча не десинкают (баг 2).
-    _prepare_start_environment()
+    ts_state = _prepare_start_environment()
 
     # Ждать сеть надо ДО запуска winws (маршрут по умолчанию должен уже быть):
     # вручную на подключившемся Wi-Fi старт происходит сразу, а на логоне Wi-Fi
@@ -716,7 +752,7 @@ def _start_locked(batch_path, display_version):
     # (не блокируем навсегда).
     _wait_for_network()
 
-    for line in _diag_environment_lines():
+    for line in _diag_environment_lines(ts=ts_state, windivert=wd_state):
         logging.info(f"[SERVICE] Состояние на старте: {line}")
 
     try:
@@ -788,7 +824,7 @@ def _get_running_strategy():
 
 def _service_running():
     """Служба SakuraFlowService в состоянии RUNNING?"""
-    result = run_cmd(f'sc.exe query "{SERVICE_NAME}"', timeout=10)
+    result = _sc_query()
     return bool(result) and bool(_RUN_RE.search(result.stdout or ""))
 
 

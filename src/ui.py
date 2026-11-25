@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import ctypes
 import logging
 
@@ -80,6 +81,27 @@ class _GuiBridge(QObject):
             fn()
         except Exception as e:
             logging.error(f"[bridge] {e}")
+
+
+def _post_to_gui(bridge, fn):
+    """Queued-передать callable в GUI-поток. Фоновый воркер может закончиться
+    ПОСЛЕ закрытия окна/рестарта трея — C++-объект моста уже удалён, и
+    invokeMethod кидает RuntimeError. Такой результат всё равно некому
+    применять, поэтому просто молча пропускаем."""
+    try:
+        QMetaObject.invokeMethod(bridge, "_run", Qt.QueuedConnection,
+                                 Q_ARG(object, fn))
+    except RuntimeError:
+        logging.debug("[bridge] GUI-мост уже удалён — результат воркера пропущен")
+
+
+def _post_slot(receiver, slot, qarg):
+    """То же для вызова слота не-моста (MTProxy/логи): окно могло закрыться,
+    пока воркер ещё считал — Qt-объект уже удалён, invokeMethod кидает."""
+    try:
+        QMetaObject.invokeMethod(receiver, slot, Qt.QueuedConnection, qarg)
+    except RuntimeError:
+        logging.debug(f"[gui] {slot}: получатель уже удалён — сигнал пропущен")
 
 
 class ListEditorWindow(QWidget):
@@ -427,9 +449,7 @@ class NetworkToolsWindow(QWidget):
             def _apply():
                 done(result, error)
 
-            QMetaObject.invokeMethod(self._bridge, "_run",
-                                     Qt.QueuedConnection,
-                                     Q_ARG(object, _apply))
+            _post_to_gui(self._bridge, _apply)
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -449,9 +469,7 @@ class NetworkToolsWindow(QWidget):
                 def _apply():
                     self._ipv6_sync_busy = False
 
-                QMetaObject.invokeMethod(self._bridge, "_run",
-                                         Qt.QueuedConnection,
-                                         Q_ARG(object, _apply))
+                _post_to_gui(self._bridge, _apply)
 
         threading.Thread(target=_task, daemon=True).start()
 
@@ -734,8 +752,7 @@ class NetworkToolsWindow(QWidget):
                         self.log_append(f"Failed to start MTPROTO proxy on {host}:{port}", "red")
                         return
                 state.save_state(mtproto_enabled=True, mtproto_port=port, mtproto_host=host, mtproto_secret=secret)
-                QMetaObject.invokeMethod(self, "_open_proxy_url",
-                                         Qt.QueuedConnection, Q_ARG(str, link))
+                _post_slot(self, "_open_proxy_url", Q_ARG(str, link))
             except Exception as e:
                 self.log_append(f"ERROR: {e}", "red")
             finally:
@@ -788,9 +805,7 @@ class NetworkToolsWindow(QWidget):
                         final_running = tools.is_mtproto_proxy_running(port=port, host=host)
                     except Exception:
                         final_running = False
-                    QMetaObject.invokeMethod(self, "_finalize_mtproto",
-                                             Qt.QueuedConnection,
-                                             Q_ARG(bool, final_running))
+                    _post_slot(self, "_finalize_mtproto", Q_ARG(bool, final_running))
             threading.Thread(target=do_stop, daemon=True).start()
         else:
             self.log_append("Starting MTPROTO proxy...")
@@ -814,9 +829,7 @@ class NetworkToolsWindow(QWidget):
                         final_running = tools.is_mtproto_proxy_running(port=port, host=host)
                     except Exception:
                         final_running = False
-                    QMetaObject.invokeMethod(self, "_finalize_mtproto",
-                                             Qt.QueuedConnection,
-                                             Q_ARG(bool, final_running))
+                    _post_slot(self, "_finalize_mtproto", Q_ARG(bool, final_running))
             threading.Thread(target=do_start, daemon=True).start()
 
     @pyqtSlot(bool)
@@ -973,8 +986,7 @@ class NetworkToolsWindow(QWidget):
                     self.apply_dns_btn.show()
                 self.test_dns_btn.setEnabled(True)
 
-            QMetaObject.invokeMethod(self._bridge, "_run",
-                                     Qt.QueuedConnection, Q_ARG(object, _apply))
+            _post_to_gui(self._bridge, _apply)
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -999,8 +1011,7 @@ class NetworkToolsWindow(QWidget):
                 self.dns_best_btn.setEnabled(True)
                 self._dns_busy = False
 
-            QMetaObject.invokeMethod(self._bridge, "_run",
-                                     Qt.QueuedConnection, Q_ARG(object, _apply))
+            _post_to_gui(self._bridge, _apply)
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -1041,7 +1052,7 @@ def _taskbar_structures():
     cached = getattr(_taskbar_structures, "_c", None)
     if cached is not None:
         return cached
-    from ctypes import (Structure, Union, c_void_p, c_wchar_p)
+    from ctypes import (Structure, Union, c_wchar_p)
     from ctypes import wintypes
 
     class GUID(Structure):
@@ -1064,7 +1075,6 @@ def _taskbar_structures():
 
     cached = dict(
         GUID=GUID, PROPERTYKEY=PROPERTYKEY, PROPVARIANT=PROPVARIANT,
-        PP=POINTER,
         IID_IPropertyStore=GUID(
             0x886d8eeb, 0x8cf2, 0x4446,
             (0x8d, 0x02, 0xcd, 0xba, 0x1d, 0xbd, 0xcf, 0x99)),
@@ -1089,11 +1099,11 @@ def _tag_top_windows():
     «пустых» проходов и возобновляется через _wake_taskbar_tagging при
     создании новых окон."""
     try:
-        from ctypes import (CFUNCTYPE, byref, cast, POINTER, windll, c_void_p)
+        from ctypes import (CFUNCTYPE, byref, cast, POINTER, windll, c_void_p,
+                            c_long, c_ulong)
 
         s = _taskbar_structures()
-        GUID, PROPERTYKEY, PROPVARIANT = (s["GUID"], s["PROPERTYKEY"],
-                                          s["PROPVARIANT"])
+        PROPERTYKEY, PROPVARIANT = s["PROPERTYKEY"], s["PROPVARIANT"]
         IID_IPropertyStore = s["IID_IPropertyStore"]
         PKEY_AppUserModel_ID = s["PKEY_AppUserModel_ID"]
 
@@ -1275,7 +1285,8 @@ def create_tray_app(bat_files, register_sleep_handler=None):
     # воркер будит его через QMetaObject.invokeMethod(_bridge, "_run") (queued в
     # event loop GUI-потока, thread-safe), sync-таймер — фолбэк, если иначе не дошло.
     _bridge = _GuiBridge()
-    _strategy_busy = {"on": False, "done": False, "running": False}
+    _strategy_busy = {"on": False, "done": False, "running": False,
+                      "since": 0.0, "seq": 0}
     # Единственный запусковый вызов is_winws_running() в GUI; дальше состояние
     # обновляется фоновым пробингом, а 1-секундный таймер только читает кэш.
     _winws_cached = {"v": tools.is_winws_running()}
@@ -1307,8 +1318,7 @@ def create_tray_app(bat_files, register_sleep_handler=None):
             except Exception:
                 pass
 
-        QMetaObject.invokeMethod(_bridge, "_run", Qt.QueuedConnection,
-                                 Q_ARG(object, _show))
+        _post_to_gui(_bridge, _show)
 
     def _set_start_btn_pending(btn, starting):
         """Мгновенная реакция на клик, не дожидаясь работы службы.
@@ -1335,18 +1345,24 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         starting = not _winws_cached["v"]
         _strategy_busy["on"] = True
         _strategy_busy["done"] = False
+        _strategy_busy["since"] = time.time()
+        seq = _strategy_busy["seq"] + 1
+        _strategy_busy["seq"] = seq
         _set_start_btn_pending(btn, starting)
 
         def _notify_done(running):
+            # watchdog уже снял Pending — старый результат не применяем
+            if _strategy_busy["seq"] != seq:
+                return
             _strategy_busy["done"] = True
             _strategy_busy["running"] = running
 
             def _apply():
+                if _strategy_busy["seq"] != seq:
+                    return
                 _finish(running)
 
-            QMetaObject.invokeMethod(_bridge, "_run",
-                                     Qt.QueuedConnection,
-                                     Q_ARG(object, _apply))
+            _post_to_gui(_bridge, _apply)
 
         def _work():
             # Направление уже выбрано по кэшу в клике. Повторная проверка
@@ -1365,14 +1381,16 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                     bat_path = tools.pick_strategy_bat(bat_files, last_bat)
                     if not bat_path:
                         logging.error("[toggle_strategy] No strategy .bat found")
-                        _notify_start_failure()
+                        if _strategy_busy["seq"] == seq:
+                            _notify_start_failure()
                     else:
                         state.save_state(last_bat=bat_path.stem, stopped=False)
                         if not service.start_service(bat_path, bat_path.stem):
-                            _notify_start_failure()
+                            if _strategy_busy["seq"] == seq:
+                                _notify_start_failure()
             except Exception as e:
                 logging.error(f"[toggle_strategy] {'Stop' if was_running else 'Start'} error: {e}")
-                if not was_running:
+                if not was_running and _strategy_busy["seq"] == seq:
                     _notify_start_failure()
             finally:
                 # успешный start_service не обязан сразу дать RUNNING — берём
@@ -1442,8 +1460,7 @@ def create_tray_app(bat_files, register_sleep_handler=None):
         def _apply():
             _apply_autostart_state(enabled)
 
-        QMetaObject.invokeMethod(_bridge, "_run", Qt.QueuedConnection,
-                                 Q_ARG(object, _apply))
+        _post_to_gui(_bridge, _apply)
 
     def _on_autostart_toggled(chk):
         _autostart_user_set["v"] = True
@@ -1569,18 +1586,25 @@ def create_tray_app(bat_files, register_sleep_handler=None):
                     return  # пока идёт Start/Stop, кнопку не трогаем
                 _apply_winws_state(running)
 
-            QMetaObject.invokeMethod(_bridge, "_run",
-                                     Qt.QueuedConnection,
-                                     Q_ARG(object, _apply))
+            _post_to_gui(_bridge, _apply)
 
         threading.Thread(target=_work, daemon=True).start()
 
     def sync_start_btn():
         # рабочий поток завершился -> финализируем ТОЛЬКО тут, в GUI-потоке
-        if _strategy_busy["on"] and _strategy_busy["done"]:
-            _finish(_strategy_busy["running"])
         if _strategy_busy["on"]:
-            _absent_ticks["n"] = 0
+            if _strategy_busy["done"]:
+                _finish(_strategy_busy["running"])
+            elif time.time() - _strategy_busy["since"] > 25:
+                # Страховка: воркер может ждать _service_lock фонового старта
+                # из main.py или зависший sc.exe. Без этого кнопка висела бы
+                # на «Starting...» бесконечно (done от воркера не придёт).
+                logging.error("[toggle_strategy] Start/Stop не вернулся за 25с "
+                              "— снимаю Pending")
+                _strategy_busy["seq"] += 1  # старый воркер больше не применяем
+                _finish(False)
+            else:
+                _absent_ticks["n"] = 0
             return
         _probe_winws_async()
 
